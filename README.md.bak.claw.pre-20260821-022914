@@ -1,0 +1,131 @@
+# Active Recall
+
+一个不占 memory slot 的 **OpenClaw 薄插件**：在 `before_prompt_build` 阶段做「结构化 query expansion + 多路检索 RRF 融合」，把本地记忆（memory-core / BGE-M3 + BM25）里相关的背景注入到 prompt 上下文。
+
+> 定位：**薄插件**，复用现有 memory-core 后端，不自建索引、不抢 memory slot。它只做「学会想起」——在你发消息时，先联想出这条消息背后隐含的实体/话题，再并行检索、融合、注入。
+
+## 它解决什么问题
+
+默认的 memory 检索是**单查询**：拿你的原话直接搜一次。遇到模糊问题（不点名项目名、不点出实体）就抓瞎——比如「那个审批插件现在推进到哪一步了」，它得自己联想出 `human-gate`、`flood detector`、`P1 评估` 这些没明说的东西才搜得到。
+
+Active Recall 的做法：先让 LLM 把问题**结构化展开**成「改写 + 多个联想查询」，再**多路并行检索**，用 **RRF（Reciprocal Rank Fusion）** 融合排序，最后注入。
+
+## 核心流程
+
+```
+用户消息
+  │
+  ▼
+① literal 搜索（原句直搜）
+  │
+  ├─ 命中「强信号」(top1≥0.85 且 gap≥0.15) ──► 直接融合注入（跳过 expansion，省一次 LLM 调用）
+  │
+  └─ 否则
+       ▼
+② 结构化 Query Expansion（单次 LLM 调用，输出 JSON）
+       { "rewrite": "...", "associations": [{"type":"project","query":"..."}, ...] }
+       │
+       ▼
+③ 多路并行检索：literal + rewrite + assoc:project + assoc:history + ...
+       │
+       ▼
+④ RRF 融合排序 → 注入 <recall-context> 块到 prompt
+```
+
+关键约束：**expansion 任何 profile 下只允许 1 次 LLM round-trip**（「头脑风暴 N 角度再逐角度搜」在实验里 6/6 超时，是死路，禁了）。
+
+## 三种 profile
+
+| profile | expansion | 联想轴数 | 检索结果数 | 注入 token 预算 |
+|---------|-----------|---------|-----------|----------------|
+| `speed` | ❌ 跳过 | 0 | 3 | ~400 |
+| `balanced`（默认） | ✅ | 1 | 5 | ~800 |
+| `deep` | ✅ | 3 | 8 | ~1200 |
+
+## 关键设计
+
+- **fail-open 铁律**：超时 / 失败绝不阻塞主回复。expansion 失败或超时 → 复用 literal 结果直接注入（不重复检索），最坏情况返回 `undefined` 让主回复正常走。
+- **进程内检索**：优先复用 gateway 里已注册的 memory runtime（`getActiveMemorySearchManager`），无 CLI spawn，单次 ~秒级；不可用时自动 fallback 到 `openclaw memory search` CLI。
+- **强信号 gate**：literal 命中 top1≥0.85 且与次高分差 ≥0.15 时跳过 expansion——「命中 = expansion 不必要，≠ memory 不必要」。
+- **跳过内部会话**：active-memory 嵌入子回话、cron / heartbeat 会话、system event 不触发（正则 `(?:^|:)active-memory[:_-]|(?:^|:)(?:cron|heartbeat)(?:$|:)`）。
+- **trace 落盘**：每次运行写 `memory/recall-traces.jsonl`（status / elapsed / expansion / searches / fusionTop / injectedChars），不展示 score（避免虚假精确感）。
+
+## 安装
+
+```bash
+openclaw plugins install   # 本地文件插件：指向本目录 index.ts
+```
+
+`openclaw.json` 只需加：
+
+```json
+{
+  "plugins": {
+    "allow": ["active-recall"],
+    "entries": { "active-recall": { "enabled": true } }
+  }
+}
+```
+
+**注意**：与 `active-memory` 互斥（二者都在 `before_prompt_build` 注入记忆上下文）。上 Active Recall 前先禁用 active-memory 做 A/B。
+
+## 配置
+
+全部走 `plugins.entries.active-recall.config`，带默认值（`openclaw.plugin.json` 的 `configSchema`）：
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `enabled` | `true` | 总开关 |
+| `agents` | `["main"]` | 生效的 agent 列表 |
+| `skipSystemEvents` | `true` | 跳过系统事件 |
+| `profile` | `"balanced"` | `speed` / `balanced` / `deep` |
+| `injectTokenBudget` | profile 决定 | 注入 token 预算 |
+| `maxTotalMs` | `25000` | 整轮硬超时（fail-open 触发线） |
+| `searchTimeoutMs` | `15000` | 单路检索超时 |
+| `minScore` | `0.55` | 检索最低分 |
+| `topK` | `5` | 融合后取前 K |
+| `snippetChars` | `200` | 每条命中 snippet 长度 |
+| `expansion.endpoint` | `https://api.deepseek.com/v1` | expansion LLM 端点 |
+| `expansion.apiKeyEnv` | `DEEPSEEK_API_KEY` | 从哪个环境变量读 key |
+| `expansion.model` | `deepseek-v4-flash` | expansion 模型 |
+| `expansion.timeoutMs` | `8000` | expansion 硬超时 |
+| `expansion.maxOutputTokens` | `800` | expansion 最大输出（推理模型需留 reasoning 预算） |
+| `expansion.associations.maxBalanced` | `1` | balanced 联想轴数 |
+| `expansion.associations.maxDeep` | `3` | deep 联想轴数 |
+| `strongSignal.enabled` | `true` | 强信号 gate 开关 |
+| `strongSignal.minScore` | `0.85` | top1 阈值 |
+| `strongSignal.gap` | `0.15` | top1 与次高分差 |
+| `rrf.k` | `60` | RRF 常数 |
+| `rrf.originalWeight` | `2.0` | literal 原句权重 |
+| `preferSources.memory/wiki/sessions` | `1.0` | 各来源加权 |
+| `trace.enabled` | `true` | trace 开关 |
+| `trace.file` | `memory/recall-traces.jsonl` | trace 路径 |
+
+## 模块结构
+
+```
+index.ts        主流程编排：hook 注册、强信号 gate、多路检索、注入、trace
+clean-prompt.ts 清洗 prompt + 识别 system event
+config.ts       配置读取（默认值 + profile 预算）
+expansion.ts    LLM query expansion（JSON 输出：rewrite + typed associations）
+search.ts       检索（进程内优先 + CLI fallback）
+fusion.ts       RRF 融合 + 强信号判定
+trace.ts        trace 落盘
+```
+
+## 测试
+
+```bash
+npm test   # node --test tests/，当前 7/7 通过
+```
+
+## 已知限制 / 待办
+
+- **expansion 依赖 deepseek 抖动**：`ok` / `timeout` / `parse_fail` 会轮换出现（API 层不稳，非插件问题）。有 fail-open 兜底，最坏退化成 literal-only 注入。
+- **命中质量待调**：模糊短查询目前只能命中 session 文件，联想出项目实体的质量还需用「不点名」的完整问题验证。
+- `disableActiveMemoryHint` 配置项已在 schema 声明，但当前版本靠硬编码正则跳过内部会话（未读取该配置项）。
+
+## 背景
+
+- 设计定论见 `specs/active-recall-plugin-spec.md`（v0.2）
+- 联想式 expansion 的 A/B 实验结论见 `memory/exp-expansion-runs-2026-08-16.md`（实验组 6/6 超时，单次结构化 expansion 是唯一可行路线）

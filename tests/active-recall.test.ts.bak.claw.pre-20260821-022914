@@ -1,0 +1,88 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { cleanPromptForSearch } from "../clean-prompt.js";
+import { readConfig } from "../config.js";
+import { expandQuery } from "../expansion.js";
+import { fuseRoutes, isStrongSignal, successfulRoutes } from "../fusion.js";
+import { injectContext } from "../index.js";
+import type { SearchRoute } from "../fusion.js";
+
+const route = (name: string, hits: Array<{ path: string; score: number; source?: string }>, weight = 1): SearchRoute => ({
+  route: name,
+  weight,
+  result: {
+    hits: hits.map((hit) => ({ ...hit, snippet: `${hit.path} snippet`, source: hit.source ?? "memory" })),
+    timing: { spawnMs: 1, searchMs: 1, totalMs: 2 },
+    rawOutput: "[]",
+  },
+});
+
+test("cleanPromptForSearch strips documented OpenClaw artifacts", () => {
+  const fixtures = [
+    { name: "recall and vault blocks", input: "question\n<recall-context>old recall</recall-context>\n<vault-memory>old vault</vault-memory>", expected: "question" },
+    { name: "sender metadata JSON", input: "Sender (untrusted metadata)\n{\n  \"name\": \"ignored\"\n}\n\nquestion", expected: "question" },
+    { name: "runtime metadata JSON", input: "OpenClaw runtime context (internal)\n{\n  \"session\": \"ignored\"\n}\nquestion", expected: "question" },
+    { name: "system and timestamp", input: "System: internal instruction\n[Sat 2026-08-16 05:50 GMT+8] what did we decide?", expected: "what did we decide?" },
+    { name: "empty after cleanup", input: "<recall-context>only context</recall-context>\n\nSystem: no", expected: "" },
+  ];
+  for (const fixture of fixtures) assert.equal(cleanPromptForSearch(fixture.input), fixture.expected, fixture.name);
+});
+
+test("RRF ranks a repeated result before one literal-only result", () => {
+  const fused = fuseRoutes([
+    route("literal", [{ path: "a", score: 0.9 }, { path: "b", score: 0.8 }], 2),
+    route("rewrite", [{ path: "b", score: 0.7 }, { path: "c", score: 0.6 }]),
+  ], { k: 60, preferSources: { memory: 1 }, snippetChars: 100, topK: 5 });
+  assert.deepEqual(fused.map((hit) => hit.path), ["b", "a", "c"]);
+  assert.equal(fused[0].routeHits, 2);
+});
+
+test("strong signal uses inclusive 0.85 score and 0.15 gap, but sessions-only stays weak", () => {
+  const settings = { enabled: true, minScore: 0.85, gap: 0.15 };
+  assert.equal(isStrongSignal(route("x", [{ path: "a", score: 0.85 }, { path: "b", score: 0.70 }]).result.hits, settings), true);
+  assert.equal(isStrongSignal(route("x", [{ path: "a", score: 0.85 }, { path: "b", score: 0.701 }]).result.hits, settings), false);
+  assert.equal(isStrongSignal(route("x", [{ path: "a", score: 0.9, source: "sessions" }]).result.hits, settings), false);
+});
+
+test("expansion timeout and malformed JSON both degrade to null", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => { throw new DOMException("timed out", "TimeoutError"); };
+    const timeout = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.deepEqual(timeout, { result: null, status: "timeout" });
+    globalThis.fetch = async () => new Response(JSON.stringify({ choices: [{ message: { content: "not json" } }] }), { status: 200 });
+    const malformed = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.deepEqual(malformed, { result: null, status: "parse_fail" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("allSettled partial fusion preserves successful routes", () => {
+  const settled: PromiseSettledResult<SearchRoute>[] = [
+    { status: "fulfilled", value: route("literal", [{ path: "kept", score: 0.8 }], 2) },
+    { status: "rejected", reason: new Error("timeout") },
+  ];
+  const fused = fuseRoutes(successfulRoutes(settled), { k: 60, preferSources: { memory: 1 }, snippetChars: 50, topK: 5 });
+  assert.equal(fused.length, 1);
+  assert.equal(fused[0].path, "kept");
+});
+
+test("fusion finalScore is the only descending sort key", () => {
+  const fused = fuseRoutes([
+    route("first", [{ path: "low-raw-high-weight", score: 0.1, source: "memory" }]),
+    route("second", [{ path: "high-raw-low-weight", score: 0.99, source: "sessions" }]),
+  ], { k: 60, preferSources: { memory: 2, sessions: 0.5 }, snippetChars: 50, topK: 5 });
+  assert.deepEqual(fused.map((hit) => hit.path), ["low-raw-high-weight", "high-raw-low-weight"]);
+  assert.ok(fused[0].finalScore > fused[1].finalScore);
+});
+
+test("injection includes a known line anchor and omits all score fields", () => {
+  const fused = fuseRoutes([route("literal", [{ path: "memory/example.md", score: 0.9 }], 2)], {
+    k: 60, preferSources: { memory: 1 }, snippetChars: 100, topK: 5,
+  });
+  fused[0].line = 42;
+  const context = injectContext(fused, 400);
+  assert.match(context ?? "", /memory\/example\.md#L42/);
+  assert.doesNotMatch(context ?? "", /score=/i);
+});

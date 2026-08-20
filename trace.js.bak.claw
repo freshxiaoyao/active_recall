@@ -1,0 +1,36 @@
+import { appendFile, mkdir } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
+                                            
+                                                
+                                                       
+
+                              
+             
+                  
+                  
+                                                                                          
+                    
+                     
+                       
+                               
+                                                                                              
+                                                                                 
+                                                                                                                       
+                        
+                         
+ 
+
+export async function writeTrace(
+  trace             ,
+  file        ,
+  workspaceDir         ,
+)                {
+  const target = isAbsolute(file) ? file : resolve(workspaceDir ?? join(homedir(), ".openclaw", "workspace"), file);
+  await mkdir(dirname(target), { recursive: true });
+  await appendFile(target, `${JSON.stringify(trace)}\n`, "utf8");
+}
+
+
+//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active-recall\trace.ts

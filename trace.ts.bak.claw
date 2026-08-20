@@ -1,0 +1,33 @@
+import { appendFile, mkdir } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { FusedHit } from "./fusion.js";
+import type { SearchTiming } from "./search.js";
+import type { RecallTriggerReason } from "./demand.js";
+
+export interface TraceRecord {
+  ts: string;
+  session: string;
+  profile: string;
+  status: "ok" | "partial" | "timeout" | "fail_open" | "no_result" | "skipped_not_needed";
+  elapsedMs: number;
+  queryChars: number;
+  cleanedChars: number;
+  trigger: RecallTriggerReason;
+  expansion: "ok" | "skipped_strong" | "timeout" | "parse_fail" | "skipped_speed" | "not_run";
+  searches: Array<{ route: string; query: string; hits: number } & SearchTiming>;
+  fusionTop: Array<Pick<FusedHit, "path" | "bestRawScore" | "rrfScore" | "routeHits" | "sourceWeight" | "finalScore">>;
+  injectedChars: number;
+  injectedTokens: number;
+}
+
+export async function writeTrace(
+  trace: TraceRecord,
+  file: string,
+  workspaceDir?: string,
+): Promise<void> {
+  const target = isAbsolute(file) ? file : resolve(workspaceDir ?? join(homedir(), ".openclaw", "workspace"), file);
+  await mkdir(dirname(target), { recursive: true });
+  await appendFile(target, `${JSON.stringify(trace)}\n`, "utf8");
+}

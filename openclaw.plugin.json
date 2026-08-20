@@ -1,0 +1,90 @@
+{
+  "id": "active-recall",
+  "name": "Active Recall",
+  "description": "On-demand memory recall with a zero-LLM trigger gate, structured query expansion, and multi-route RRF retrieval. Thin companion over the existing memory_search backend; does NOT own the memory slot.",
+  "activation": {
+    "onCapabilities": ["hook"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean", "default": true },
+      "agents": { "type": "array", "items": { "type": "string" }, "default": ["main"] },
+      "skipSystemEvents": { "type": "boolean", "default": true },
+      "trigger": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": { "type": "string", "enum": ["on-demand", "always", "explicit"], "default": "on-demand" },
+          "explicitPrefixes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": ["/recall", "/memory", "回忆：", "记忆："] },
+          "suppressPrefixes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": ["/no-recall", "/no-memory", "不查记忆："] },
+          "additionalKeywords": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [] }
+        }
+      },
+      "profile": { "type": "string", "enum": ["speed", "balanced", "deep"], "default": "balanced" },
+      "injectTokenBudget": { "type": "number", "minimum": 100, "maximum": 4000, "default": 800 },
+      "maxTotalMs": { "type": "number", "minimum": 500, "maximum": 60000, "default": 25000 },
+      "searchTimeoutMs": { "type": "number", "minimum": 100, "maximum": 30000, "default": 15000 },
+      "expansion": {
+        "type": "object",
+        "properties": {
+          "endpoint": { "type": "string", "default": "https://api.deepseek.com/v1" },
+          "apiKeyEnv": { "type": "string", "default": "DEEPSEEK_API_KEY" },
+          "model": { "type": "string", "default": "deepseek-v4-flash" },
+          "headers": { "type": "object" },
+          "timeoutMs": { "type": "number", "minimum": 500, "maximum": 30000, "default": 8000 },
+          "maxOutputTokens": { "type": "number", "minimum": 50, "maximum": 4000, "default": 800 },
+          "associations": {
+            "type": "object",
+            "properties": {
+              "maxBalanced": { "type": "number", "default": 1 },
+              "maxDeep": { "type": "number", "default": 3 }
+            }
+          }
+        }
+      },
+      "strongSignal": {
+        "type": "object",
+        "properties": {
+          "minScore": { "type": "number", "default": 0.85 },
+          "gap": { "type": "number", "default": 0.15 },
+          "enabled": { "type": "boolean", "default": true }
+        }
+      },
+      "qualityGate": {
+        "type": "object",
+        "properties": {
+          "minBestRawScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.65 }
+        }
+      },
+      "rrf": {
+        "type": "object",
+        "properties": {
+          "k": { "type": "number", "default": 20 },
+          "originalWeight": { "type": "number", "default": 2.0 },
+          "rawScoreBlend": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 }
+        }
+      },
+      "topK": { "type": "number", "minimum": 1, "maximum": 20, "default": 3 },
+      "snippetChars": { "type": "number", "minimum": 50, "maximum": 2000, "default": 200 },
+      "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.55 },
+      "preferSources": {
+        "type": "object",
+        "properties": {
+          "memory": { "type": "number", "default": 1.0 },
+          "wiki": { "type": "number", "default": 1.0 },
+          "sessions": { "type": "number", "default": 1.0 }
+        }
+      },
+      "trace": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "file": { "type": "string", "default": "memory/recall-traces.jsonl" }
+        }
+      },
+      "disableActiveMemoryHint": { "type": "boolean", "default": true }
+    }
+  }
+}
