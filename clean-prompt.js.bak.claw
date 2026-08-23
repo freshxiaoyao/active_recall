@@ -31,4 +31,4 @@ export function isSystemEventPrompt(prompt        )          {
 }
 
 
-//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active-recall\clean-prompt.ts
+//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active_recall\clean-prompt.ts

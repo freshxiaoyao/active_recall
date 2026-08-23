@@ -1,6 +1,6 @@
 # Active Recall
 
-一个不占 memory slot 的 **OpenClaw 薄插件**：先用零 LLM 成本的高精度门控判断当前消息是否依赖历史记忆；只有需要时，才在 `before_prompt_build` 阶段做「结构化 query expansion + 多路检索 RRF 融合」，把本地记忆（memory-core / BGE-M3 + BM25）里相关的背景注入到 prompt 上下文。
+一个不占 memory slot 的 **OpenClaw 薄插件**：先用零 LLM 成本的三级规则门控判断当前消息是否依赖历史记忆；只有规则结果为 `uncertain` 时才调用一次短超时 semantic gate。确认需要记忆后，在 `before_prompt_build` 阶段 literal-first 检索，必要时再做「结构化 query expansion + 多路检索 RRF 融合」，把本地记忆（memory-core / BGE-M3 + BM25）里相关的背景注入到 prompt 上下文。
 
 > 定位：**薄插件**，复用现有 memory-core 后端，不自建索引、不抢 memory slot。默认是**按需召回**：普通独立问题直接跳过；明确回忆、跨会话延续、历史偏好或「那个项目现在怎样」这类依赖旧上下文的问题才检索、融合、注入。
 
@@ -16,11 +16,11 @@ Active Recall 的做法：先让 LLM 把问题**结构化展开**成「改写 + 
 用户消息
   │
   ▼
-⓪ 按需触发门控（本地规则，零 LLM / 零检索）
+⓪ 按需触发门控（本地规则：yes / no / uncertain）
   │
-  ├─ 不依赖历史记忆 ──► 直接跳过，不注入
-  │
-  └─ 需要记忆
+  ├─ no ──► 直接跳过（零检索 / 零 LLM）
+  ├─ uncertain ──► 短超时 semantic gate ──► none 或 recall depth
+  └─ yes ──► 直接确定 recall depth
        ▼
 ① literal 搜索（原句直搜）
   │
@@ -28,35 +28,41 @@ Active Recall 的做法：先让 LLM 把问题**结构化展开**成「改写 + 
   │
   └─ 否则
        ▼
-② 结构化 Query Expansion（单次 LLM 调用，输出 JSON）
+② 结构化 Query Expansion（单次 LLM 调用，默认 2.5s soft timeout）
        { "rewrite": "...", "associations": [{"type":"project","query":"..."}, ...] }
        │
        ▼
 ③ 多路并行检索：literal + rewrite + assoc:project + assoc:history + ...
        │
        ▼
-④ RRF 融合排序 → 注入 <recall-context> 块到 prompt
+④ 相关性质量门 → RRF 最终排序 → 注入 <recall-context> 块到 prompt
 ```
 
 关键约束：**expansion 任何 profile 下只允许 1 次 LLM round-trip**（「头脑风暴 N 角度再逐角度搜」在实验里 6/6 超时，是死路，禁了）。
 
-## 三种 profile
+## Recall depth 与 profile
 
-| profile | expansion | 联想轴数 | 检索结果数 | 注入 token 预算 |
+| depth / profile | expansion | 联想轴数 | 检索结果数 | 默认注入 token 预算 |
 |---------|-----------|---------|-----------|----------------|
-| `speed` | ❌ 跳过 | 0 | 3 | ~400 |
+| `literal` / `speed` | ❌ 跳过 | 0 | 3 | ~400 |
 | `balanced`（默认） | ✅ | 1 | 5 | ~800 |
 | `deep` | ✅ | 3 | 8 | ~1200 |
 
 ## 关键设计
 
-- **默认按需召回**：`trigger.mode="on-demand"` 只对明确回忆意图、跨会话历史引用、已保存偏好和模糊历史实体触发；普通消息在任何检索或 expansion 之前返回。
-- **手动控制**：消息以 `/recall`、`/memory`、`回忆：` 或 `记忆：` 开头可强制召回；以 `/no-recall`、`/no-memory` 或 `不查记忆：` 开头可强制跳过。控制前缀不会进入检索 query。
+- **默认按需召回**：规则 gate 的明确 `yes` / `no` 保持零 LLM fast path；只有“可能依赖用户历史但规则无法可靠确定”的消息进入 semantic gate。semantic gate 只判断是否召回及深度，不生成 query。
+- **手动控制**：消息以 `/recall`、`/memory`、`回忆：` 或 `记忆：` 开头可强制召回；`/recall deep ...` 可显式指定深度；以 `/no-recall`、`/no-memory` 或 `不查记忆：` 开头可强制跳过。控制前缀和 depth 不进入检索 query。
+- **相关性与排名分离**：`bestRawScore` 和独立 `routeHits` 负责质量判定；默认接受 `raw >= 0.65`，或 `raw >= 0.55` 且至少 2 条独立路线一致命中。`rrfScore`、`sourceWeight` 和 `finalRankScore` 只负责排序，兼容 trace 仍保留 `finalScore` 别名。
+- **真正的多路共识**：同一路由、同一路径的重复 chunk 只贡献一次；`routeHits` 只统计不同查询路由。相同文件保留最高分 chunk，并同步更新 snippet、行号和来源。
+- **相关性加权 RRF**：RRF 贡献按 raw score 做温和折算（默认 blend `0.5`），避免低分重复结果压过高相关候选；相同最终分再按 raw score 排序。
+- **复用 literal**：首轮 literal 结果同时用于 strong-signal gate 和最终融合；expansion 成功后不再重复搜索 literal，相同 expansion query 也会去重。
+- **安全分层解析**：provider 支持时可启用 JSON Schema；默认 DeepSeek 使用 `json_object`。随后依次尝试严格 JSON、Markdown fence、按字符串/转义感知的完整对象提取，以及仅处理尾逗号/完整容器闭合的轻量 repair。`rewrite` 与 `associations` 分别容错，单个坏 association 只丢该项。
 - **fail-open 铁律**：超时 / 失败绝不阻塞主回复。expansion 失败或超时 → 复用 literal 结果直接注入（不重复检索），最坏情况返回 `undefined` 让主回复正常走。
-- **进程内检索**：优先复用 gateway 里已注册的 memory runtime（`getActiveMemorySearchManager`），无 CLI spawn，单次 ~秒级；不可用时自动 fallback 到 `openclaw memory search` CLI。
-- **强信号 gate**：literal 命中 top1≥0.85 且与次高分差 ≥0.15 时跳过 expansion——「命中 = expansion 不必要，≠ memory 不必要」。
-- **跳过内部会话**：active-memory 嵌入子回话、cron / heartbeat 会话、system event 不触发（正则 `(?:^|:)active-memory[:_-]|(?:^|:)(?:cron|heartbeat)(?:$|:)`）。
-- **trace 落盘**：每次运行写 `memory/recall-traces.jsonl`（status / elapsed / expansion / searches / fusionTop / injectedChars），不展示 score（避免虚假精确感）。
+- **低延迟预算**：默认整轮 `maxTotalMs=5000`、单路搜索 `2200ms`、expansion `2500ms`、semantic gate `1800ms`。各后续阶段只拿剩余预算；expansion 超时/失败立即复用 literal。官方 DeepSeek endpoint 默认关闭 thinking，避免简单 JSON 任务把预算消耗在 `reasoning_content` 上。trace 异步落盘，不占主回答等待链路。
+- **进程内检索优先**：复用 gateway 里已注册的 memory runtime（`getActiveMemorySearchManager`）；不可用时才在同一搜索预算的剩余时间内 fallback 到 `openclaw memory search` CLI。
+- **source-aware 强信号**：curated memory 默认 `0.85/0.15`，project/document memory 默认略高 `0.87/0.15`；session 默认要求 `0.92/0.20`，但不再永久排除。达到来源阈值和 top1-top2 gap 时跳过 expansion。
+- **跳过内部会话**：active-memory 子会话、dreaming、cron / heartbeat 会话和 system event 不触发，避免内部摘要任务污染召回与 trace。
+- **trace 落盘**：每次运行写 `memory/recall-traces.jsonl`；记录 `structured_ok` / `partial_parse` / `repair_success` / `parse_fail` 及细分失败原因，同时加入 `literalMs`、`gateMs`、`expansionMs`、`searchMs`、`fusionMs`、`totalMs`。不保存原始 LLM 内容。
 
 ## 安装
 
@@ -92,23 +98,35 @@ openclaw plugins install   # 本地文件插件：指向本目录 index.ts
 | `trigger.additionalKeywords` | `[]` | 额外触发关键词；大小写不敏感，按字面包含匹配 |
 | `profile` | `"balanced"` | `speed` / `balanced` / `deep` |
 | `injectTokenBudget` | profile 决定 | 注入 token 预算 |
-| `maxTotalMs` | `25000` | 整轮硬超时（fail-open 触发线） |
-| `searchTimeoutMs` | `15000` | 单路检索超时 |
+| `maxTotalMs` | `5000` | 整轮 hard budget；后续阶段只使用剩余预算 |
+| `searchTimeoutMs` | `2200` | 单路检索总预算（进程内优先，CLI 只用剩余时间） |
 | `minScore` | `0.55` | 检索最低分 |
-| `topK` | `5` | 融合后取前 K |
+| `topK` | `3` | 质量门通过后最多注入前 K 条 |
 | `snippetChars` | `200` | 每条命中 snippet 长度 |
 | `expansion.endpoint` | `https://api.deepseek.com/v1` | expansion LLM 端点 |
 | `expansion.apiKeyEnv` | `DEEPSEEK_API_KEY` | 从哪个环境变量读 key |
 | `expansion.model` | `deepseek-v4-flash` | expansion 模型 |
-| `expansion.timeoutMs` | `8000` | expansion 硬超时 |
-| `expansion.maxOutputTokens` | `800` | expansion 最大输出（推理模型需留 reasoning 预算） |
+| `expansion.timeoutMs` | `2500` | expansion soft timeout；失败立即回退 literal |
+| `expansion.maxOutputTokens` | `800` | expansion 最大输出；若显式启用 thinking，应按 reasoning 开销相应提高 |
+| `expansion.responseFormat` | `"json_object"` | `json_object` / `json_schema`；仅在 provider 明确支持时设为后者 |
+| `expansion.thinkingMode` | `"auto"` | 官方 DeepSeek endpoint 自动发送 `thinking: disabled`；其他兼容 provider 默认不发送。也可显式设为 `enabled` / `disabled` / `omit` |
 | `expansion.associations.maxBalanced` | `1` | balanced 联想轴数 |
 | `expansion.associations.maxDeep` | `3` | deep 联想轴数 |
+| `semanticGate.enabled` | `true` | 仅对 regex `uncertain` 启用廉价语义判定 |
+| `semanticGate.model` | 继承 expansion model | semantic gate 模型 |
+| `semanticGate.timeoutMs` | `1800` | semantic gate 严格短超时 |
+| `semanticGate.maxOutputTokens` | `160` | semantic gate 最大输出 |
 | `strongSignal.enabled` | `true` | 强信号 gate 开关 |
 | `strongSignal.minScore` | `0.85` | top1 阈值 |
 | `strongSignal.gap` | `0.15` | top1 与次高分差 |
-| `rrf.k` | `60` | RRF 常数 |
+| `strongSignal.sources.memory/documents/wiki/sessions/default` | source-aware | 每类来源独立 `minScore` / `gap`；session 默认 `0.92/0.20` |
+| `qualityGate.highRawScore` | `0.65` | 单路即可通过的高相关阈值 |
+| `qualityGate.mediumRawScore` | `0.55` | 需要多路共识的中等相关阈值 |
+| `qualityGate.minRouteHits` | `2` | 中等相关候选所需独立路线数 |
+| `qualityGate.minBestRawScore` | `0.65` | 兼容旧配置的 `highRawScore` 别名 |
+| `rrf.k` | `20` | RRF 常数；小候选集下增强 rank 区分度 |
 | `rrf.originalWeight` | `2.0` | literal 原句权重 |
+| `rrf.rawScoreBlend` | `0.5` | raw score 对每路 RRF 贡献的折算比例，范围 0–1 |
 | `preferSources.memory/wiki/sessions` | `1.0` | 各来源加权 |
 | `trace.enabled` | `true` | trace 开关 |
 | `trace.file` | `memory/recall-traces.jsonl` | trace 路径 |
@@ -117,13 +135,15 @@ openclaw plugins install   # 本地文件插件：指向本目录 index.ts
 
 ```
 index.ts        主流程编排：hook 注册、按需 gate、强信号 gate、多路检索、注入、trace
-demand.ts       零 LLM 按需触发判定 + 强制召回/跳过前缀
+demand.ts       零 LLM yes/no/uncertain 判定 + 显式 depth
 clean-prompt.ts 清洗 prompt + 识别 system event
 config.ts       配置读取（默认值 + profile 预算）
-expansion.ts    LLM query expansion（JSON 输出：rewrite + typed associations）
+semantic-gate.ts 仅 uncertain 调用的短超时 recall/depth 语义判定
+structured-output.ts 共享 JSON candidate 提取、轻量 repair 与 response_format
+expansion.ts    LLM query expansion + 分字段 schema 容错（rewrite + typed associations）
 search.ts       检索（进程内优先 + CLI fallback）
-fusion.ts       RRF 融合 + 强信号判定
-trace.ts        trace 落盘
+fusion.ts       路由内去重 + relevance quality gate + finalRankScore + source-aware strong signal
+trace.ts        trace 落盘（含阶段 latency、source / routes / occurrences）
 ```
 
 ## 测试
@@ -134,8 +154,9 @@ npm test   # 生成 JS 后运行 node --test tests/
 
 ## 已知限制 / 待办
 
-- **expansion 依赖 deepseek 抖动**：`ok` / `timeout` / `parse_fail` 会轮换出现（API 层不稳，非插件问题）。有 fail-open 兜底，最坏退化成 literal-only 注入。
-- **命中质量待调**：模糊短查询目前只能命中 session 文件，联想出项目实体的质量还需用「不点名」的完整问题验证。
+- **DeepSeek 当前默认只能可靠使用 `json_object` response format**：`json_schema` 是给明确支持该格式的兼容 provider 的显式选项。轻量结构化调用默认关闭 DeepSeek thinking，避免短预算内只返回 `reasoning_content` 而最终 `content` 为空。无法恢复的内容以 `parse_fail` / `payload_fail` 记录 content 类型、finish reason 和是否存在 reasoning content，并 fail-open 退化为 literal-only；默认不重试，避免额外成本和延迟。
+- **semantic gate 是低延迟保守 fallback**：超时、HTTP、payload 或 parse 失败时，`uncertain` 按原 regex 的安全结果（不召回）处理，不阻塞主回答。
+- **阈值仍需人工标注集**：`0.65` 高阈值来自现有 trace 的保守校准；`0.55 + 2 routes` 复用原检索阈值并要求独立路线共识。后续仍应以 Hit@1、MRR@3 和 false-injection rate 定量迭代。
 - `disableActiveMemoryHint` 配置项已在 schema 声明，但当前版本靠硬编码正则跳过内部会话（未读取该配置项）。
 
 ## 背景

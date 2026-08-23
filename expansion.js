@@ -1,32 +1,82 @@
-                                                   
 
-                              
-               
-                
- 
+import { messageTextContent, parseJsonCandidates, structuredResponseFormat, thinkingRequestField } from "./structured-output.js";
 
-                                  
-                  
-                              
- 
 
-                                      
-                
-                
-                 
- 
 
-                                                        
-                                   
-                                 
-                                  
- 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const expansionSchema                          = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    rewrite: { type: "string" },
+    associations: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: { type: { type: "string" }, query: { type: "string" } },
+        required: ["type", "query"],
+      },
+    },
+  },
+  required: ["rewrite", "associations"],
+};
 
 function normalizedQuery(query        )         {
   return query.replace(/\s+/g, " ").trim().toLocaleLowerCase();
 }
 
-/** Builds only genuinely new expansion routes; the caller reuses its literal result. */
 export function buildExpansionSearchRoutes(original        , expansion                 )                        {
   const seen = new Set([normalizedQuery(original)]);
   const routes                        = [];
@@ -43,23 +93,68 @@ export function buildExpansionSearchRoutes(original        , expansion          
 }
 
 function expansionPrompt(message        , max        )         {
-  return `Given the user message, output JSON only:\n{"rewrite": "<one broadened query covering implied entities/topics>",\n "associations": [{"type": "project|history|decision|preference|entity",\n                   "query": "<searchable query for that axis>"}]}\nConstraints: rewrite <= 40 words; each association query <= 15 words; at most ${max} associations; do not invent facts.\n\nUser message:\n${message}`;
+  return `Given the user message, output JSON only:\n{"rewrite": "<one broadened query covering implied entities/topics>",\n "associations": [{"type": "project|history|decision|preference|entity",\n                   "query": "<searchable query for that axis>"}]}\nConstraints: rewrite <= 40 words; each association query <= 15 words; at most ${max} associations; associations may be []; do not invent facts.\n\nUser message:\n${message}`;
 }
 
-function parseExpansion(value         , max        )                         {
-  if (value === null || typeof value !== "object") return null;
+function parseExpansion(value         , max        )                                                              {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
   const candidate = value                                                 ;
-  if (typeof candidate.rewrite !== "string" || candidate.rewrite.trim() === "") return null;
-  if (!Array.isArray(candidate.associations)) return null;
+  const partialFields           = [];
+  const rewrite = typeof candidate.rewrite === "string" ? candidate.rewrite.trim() : "";
+  if (!rewrite) partialFields.push("rewrite");
+
   const associations                = [];
-  for (const item of candidate.associations.slice(0, max)) {
-    if (item === null || typeof item !== "object") continue;
-    const association = item                                       ;
-    if (typeof association.type === "string" && typeof association.query === "string" && association.query.trim()) {
-      associations.push({ type: association.type.trim(), query: association.query.trim() });
+  if (!Array.isArray(candidate.associations)) {
+    partialFields.push("associations");
+  } else {
+    for (const item of candidate.associations) {
+      if (associations.length >= max) break;
+      if (item === null || typeof item !== "object" || Array.isArray(item)) {
+        partialFields.push("association_item");
+        continue;
+      }
+      const association = item                                       ;
+      const type = typeof association.type === "string" ? association.type.trim() : "";
+      const query = typeof association.query === "string" ? association.query.trim() : "";
+      if (!type || !query) {
+        partialFields.push("association_item");
+        continue;
+      }
+      associations.push({ type, query });
     }
   }
-  return { rewrite: candidate.rewrite.trim(), associations };
+  if (!rewrite && associations.length === 0) return null;
+  return { result: { rewrite, associations }, partialFields: [...new Set(partialFields)] };
+}
+
+export function parseExpansionContent(
+  content        ,
+  max        ,
+)                                                                                                                                                     {
+  const candidates = parseJsonCandidates(content);
+  for (const candidate of candidates) {
+    const parsed = parseExpansion(candidate.value, max);
+    if (!parsed) continue;
+    const repaired = candidate.mode !== "strict";
+    return {
+      result: parsed.result,
+      status: repaired ? "repair_success" : parsed.partialFields.length > 0 ? "partial_parse" : "structured_ok",
+      diagnostics: {
+        parseMode: candidate.mode,
+        contentChars: content.length,
+        ...(parsed.partialFields.length > 0 ? { partialFields: parsed.partialFields } : {}),
+      },
+    };
+  }
+  return {
+    result: null,
+    status: "parse_fail",
+    diagnostics: {
+      parseMode: "none",
+      contentChars: content.length,
+      failureReason: candidates.length > 0 ? "schema_fail" : "json_syntax_fail",
+    },
+  };
 }
 
 export async function expandQuery(
@@ -67,6 +162,7 @@ export async function expandQuery(
   config                 ,
   maxAssociations        ,
 )                            {
+  const emptyDiagnostics                       = { parseMode: "none", contentChars: 0 };
   try {
     const apiKey = process.env[config.apiKeyEnv];
     const headers                         = {
@@ -84,20 +180,58 @@ export async function expandQuery(
         model: config.model,
         messages: [{ role: "user", content: expansionPrompt(message, maxAssociations) }],
         max_tokens: config.maxOutputTokens,
-        response_format: { type: "json_object" },
+        response_format: structuredResponseFormat(config.responseFormat, "active_recall_expansion", expansionSchema),
+        ...thinkingRequestField(config.endpoint, config.thinkingMode),
       }),
     });
-    if (!response.ok) return { result: null, status: "parse_fail" };
-    const payload = await response.json()                                                            ;
-    const content = payload.choices?.[0]?.message?.content;
-    if (typeof content !== "string") return { result: null, status: "parse_fail" };
-    const parsed = parseExpansion(JSON.parse(content), maxAssociations);
-    return parsed ? { result: parsed, status: "ok" } : { result: null, status: "parse_fail" };
+    if (!response.ok) {
+      return {
+        result: null,
+        status: "http_fail",
+        diagnostics: { ...emptyDiagnostics, failureReason: "http_fail", httpStatus: response.status },
+      };
+    }
+    let payload                                                                                                                ;
+    try {
+      payload = await response.json()                  ;
+    } catch {
+      return { result: null, status: "payload_fail", diagnostics: { ...emptyDiagnostics, failureReason: "payload_fail" } };
+    }
+    const choice = payload.choices?.[0];
+    const extracted = messageTextContent(choice?.message?.content);
+    const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : undefined;
+    const hasReasoningContent = typeof choice?.message?.reasoning_content === "string"
+      && choice.message.reasoning_content.trim().length > 0;
+    const responseDiagnostics = { finishReason, contentType: extracted.contentType, hasReasoningContent };
+    if (extracted.text === null) {
+      return {
+        result: null,
+        status: "payload_fail",
+        diagnostics: { ...emptyDiagnostics, failureReason: "payload_fail", ...responseDiagnostics },
+      };
+    }
+    const content = extracted.text;
+    if (!content.trim()) {
+      return {
+        result: null,
+        status: "parse_fail",
+        diagnostics: { parseMode: "none", contentChars: 0, failureReason: "empty_content", ...responseDiagnostics },
+      };
+    }
+    const parsed = parseExpansionContent(content, maxAssociations);
+    const diagnostics                       = { ...parsed.diagnostics, ...responseDiagnostics };
+    if (!parsed.result && finishReason === "length") diagnostics.failureReason = "truncated";
+    return { result: parsed.result, status: parsed.status, diagnostics };
   } catch (error) {
     const name = error instanceof Error ? error.name : "";
-    return { result: null, status: name === "TimeoutError" || name === "AbortError" ? "timeout" : "parse_fail" };
+    const timeout = name === "TimeoutError" || name === "AbortError";
+    return {
+      result: null,
+      status: timeout ? "timeout" : "request_fail",
+      diagnostics: { ...emptyDiagnostics, failureReason: timeout ? "timeout" : "request_fail" },
+    };
   }
 }
 
 
-//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active-recall\expansion.ts
+//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active_recall\expansion.ts

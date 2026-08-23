@@ -1,27 +1,31 @@
 import { cleanPromptForSearch, isSystemEventPrompt } from "./clean-prompt.js";
-import { maxAssociations, maxResultsForProfile, readConfig } from "./config.js";
+import { depthForProfile, maxAssociationsForDepth, maxResultsForDepth, readConfig } from "./config.js";
 import { evaluateRecallDemand } from "./demand.js";
-import { expandQuery } from "./expansion.js";
+import { buildExpansionSearchRoutes, expandQuery } from "./expansion.js";
 import { fuseRoutes, isStrongSignal, successfulRoutes } from "./fusion.js";
+import { evaluateSemanticRecall } from "./semantic-gate.js";
 import { memorySearch } from "./search.js";
 import { writeTrace } from "./trace.js";
-                                                
-                                                       
-                                               
 
-                     
-                         
-                        
-                                                 
-                                                                                                                                                                          
- 
 
-                       
-                   
-                    
-                    
-                       
- 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 function promptText(event         )         {
   const value = event               ;
@@ -34,11 +38,11 @@ function promptText(event         )         {
   return "";
 }
 
-                     
-                   
-                      
-                        
- 
+
+
+
+
+
 
 function agentId(ctx           )         {
   return typeof ctx?.agentId === "string" && ctx.agentId ? ctx.agentId : "main";
@@ -49,7 +53,7 @@ function sessionKey(ctx           )         {
 }
 
 function isInternalSession(session        )          {
-  return /(?:^|:)active-memory[:_-]|(?:^|:)(?:cron|heartbeat)(?:$|:)/.test(session);
+  return /(?:^|:)active-memory(?:$|[:_-])|(?:^|:)(?:cron|heartbeat)(?:$|:)|(?:^|:)dreaming(?:$|[:_-])/.test(session);
 }
 
 function injectContext(hits                               , budget        )                     {
@@ -67,18 +71,71 @@ function injectContext(hits                               , budget        )     
 }
 
 function remainingMs(startedAt        , limit        )         {
-  return Math.max(1, limit - Math.round(performance.now() - startedAt));
+  return Math.max(0, limit - Math.round(performance.now() - startedAt));
 }
 
-function statusForFailures(totalRoutes        , goodRoutes        , hasHits         , timedOut         )                                                           {
+function boundedTimeout(configuredMs        , remaining        )         {
+  return Math.max(1, Math.min(configuredMs, Math.max(0, remaining)));
+}
+
+
+
+function statusForFailures(totalRoutes        , goodRoutes        , hasHits         , timedOut         )                                       {
   if (hasHits) return goodRoutes === totalRoutes ? "ok" : "partial";
   if (timedOut) return "timeout";
   if (goodRoutes === 0) return "fail_open";
   return "no_result";
 }
 
-async function runRecall(api           , event         , ctx           , config              )                                                  {
+function emptyFusionStatus(routes               )                              {
+  return routes.some((route) => route.result.hits.length > 0) ? "low_quality" : "no_result";
+}
+
+function fuseForRecall(routes               , config              )                                {
+  return fuseRoutes(routes, {
+    k: config.rrf.k,
+    preferSources: config.preferSources,
+    snippetChars: config.snippetChars,
+    topK: config.topK,
+    minRawScore: config.qualityGate.mediumRawScore,
+    rawScoreBlend: config.rrf.rawScoreBlend,
+    qualityGate: config.qualityGate,
+  });
+}
+
+function queueTrace(api           , trace             , config              , ctx           )       {
+  void writeTrace(trace, config.trace.file, ctx?.workspaceDir)
+    .catch((error) => api.logger?.error?.(`active-recall trace failed: ${String(error)}`));
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+async function runRecall(
+  api           ,
+  event         ,
+  ctx           ,
+  config              ,
+  dependencyOverrides                              = {},
+)                                                  {
+  const dependencies                     = {
+    search: dependencyOverrides.search ?? memorySearch,
+    expand: dependencyOverrides.expand ?? expandQuery,
+    semanticGate: dependencyOverrides.semanticGate ?? evaluateSemanticRecall,
+  };
   const startedAt = performance.now();
+  const metrics               = { literalMs: 0, gateMs: 0, expansionMs: 0, searchMs: 0, fusionMs: 0 };
   const rawPrompt = promptText(event);
   const cleaned = cleanPromptForSearch(rawPrompt);
   const agent = agentId(ctx);
@@ -86,81 +143,158 @@ async function runRecall(api           , event         , ctx           , config 
   if (!cleaned || isInternalSession(session) || (config.skipSystemEvents && isSystemEventPrompt(rawPrompt)) || !config.agents.includes(agent)) return undefined;
 
   const demand = evaluateRecallDemand(cleaned, config.trigger);
-  if (!demand.shouldRecall) {
-    if (config.trace.enabled) {
-      void writeTrace({
-        ts: new Date().toISOString(), session, profile: config.profile, status: "skipped_not_needed",
-        elapsedMs: Math.round(performance.now() - startedAt), queryChars: rawPrompt.length, cleanedChars: cleaned.length,
-        trigger: demand.reason, expansion: "not_run", searches: [], fusionTop: [], injectedChars: 0, injectedTokens: 0,
-      }, config.trace.file, ctx?.workspaceDir).catch((error) => api.logger?.error?.(`active-recall trace failed: ${String(error)}`));
-    }
-    return undefined;
-  }
-  const searchQuery = demand.query;
-
-  let expansionStatus                                                                       = "skipped_speed";
+  let depth              = demand.depth ?? depthForProfile(config.profile);
+  let gateStatus                                 = "not_run";
+  let gateReason = demand.reason;
+  let gateFinishReason                    ;
+  let gateContentType                    ;
+  let gateHasReasoningContent                     ;
   const traceSearches                                                                                                            = [];
-  let status                                                           = "fail_open";
+  let expansionStatus                                                                                       = "not_run";
+  let expansionDiagnostics                                  ;
   let fused = []                                 ;
   let prependContext                    ;
+
+  const emitTrace = (status                       )       => {
+    if (!config.trace.enabled) return;
+    const totalMs = Math.round(performance.now() - startedAt);
+    const injected = prependContext ?? "";
+    queueTrace(api, {
+      ts: new Date().toISOString(), session, profile: config.profile, status,
+      elapsedMs: totalMs, totalMs,
+      literalMs: metrics.literalMs, gateMs: metrics.gateMs, expansionMs: metrics.expansionMs,
+      searchMs: metrics.searchMs, fusionMs: metrics.fusionMs,
+      queryChars: rawPrompt.length, cleanedChars: cleaned.length,
+      trigger: demand.reason                       , recallDepth: depth,
+      gateDecision: demand.decision, gateStatus, gateReason,
+      gateFinishReason, gateContentType, gateHasReasoningContent,
+      expansion: expansionStatus, searches: traceSearches,
+      expansionParseMode: expansionDiagnostics?.parseMode,
+      expansionFinishReason: expansionDiagnostics?.finishReason,
+      expansionContentChars: expansionDiagnostics?.contentChars,
+      expansionHttpStatus: expansionDiagnostics?.httpStatus,
+      expansionContentType: expansionDiagnostics?.contentType,
+      expansionHasReasoningContent: expansionDiagnostics?.hasReasoningContent,
+      expansionFailureReason: expansionDiagnostics?.failureReason,
+      expansionPartialFields: expansionDiagnostics?.partialFields,
+      qualityMinScore: config.qualityGate.highRawScore,
+      qualityHighRawScore: config.qualityGate.highRawScore,
+      qualityMediumRawScore: config.qualityGate.mediumRawScore,
+      qualityMinRouteHits: config.qualityGate.minRouteHits,
+      fusionTop: fused.map(({ path, bestRawScore, rrfScore, routeHits, sourceWeight, finalRankScore, finalScore, source, routes, occurrences }) => ({
+        path, bestRawScore, rrfScore, routeHits, sourceWeight, finalRankScore, finalScore, source, routes, occurrences,
+      })),
+      injectedChars: injected.length, injectedTokens: Math.ceil(injected.length / 4),
+    }, config, ctx);
+  };
+
+  if (demand.decision === "no") {
+    depth = "none";
+    emitTrace("skipped_not_needed");
+    return undefined;
+  }
+
+  if (demand.decision === "uncertain") {
+    const gateStartedAt = performance.now();
+    let gateAttempt                                                    ;
+    try {
+      gateAttempt = await dependencies.semanticGate(cleaned, config.expansion, {
+        ...config.semanticGate,
+        timeoutMs: boundedTimeout(config.semanticGate.timeoutMs, remainingMs(startedAt, config.maxTotalMs)),
+      });
+    } catch {
+      gateAttempt = { result: null, status: "request_fail", parseMode: "none" };
+    }
+    metrics.gateMs = Math.round(performance.now() - gateStartedAt);
+    gateStatus = gateAttempt.status;
+    gateReason = gateAttempt.result?.reason ?? demand.reason;
+    gateFinishReason = gateAttempt.finishReason;
+    gateContentType = gateAttempt.contentType;
+    gateHasReasoningContent = gateAttempt.hasReasoningContent;
+    if (!gateAttempt.result?.recall) {
+      depth = "none";
+      emitTrace("skipped_semantic_no");
+      return undefined;
+    }
+    depth = gateAttempt.result.depth;
+  }
+
+  const searchQuery = demand.query;
+  let status               = "fail_open";
   try {
-    const literal = await memorySearch(searchQuery, {
-      agent, maxResults: 8, minScore: config.minScore,
-      timeoutMs: Math.min(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
+    const literalStartedAt = performance.now();
+    const literal = await dependencies.search(searchQuery, {
+      agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore,
+      timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
     });
+    metrics.literalMs = Math.round(performance.now() - literalStartedAt);
+    metrics.searchMs += metrics.literalMs;
     traceSearches.push({ route: "literal", query: searchQuery, hits: literal.hits.length, ...literal.timing });
-    if (isStrongSignal(literal.hits, config.strongSignal) || config.profile === "speed") {
-      expansionStatus = isStrongSignal(literal.hits, config.strongSignal) ? "skipped_strong" : "skipped_speed";
-      fused = fuseRoutes([{ route: "literal", weight: config.rrf.originalWeight, result: literal }], {
-        k: config.rrf.k, preferSources: config.preferSources, snippetChars: config.snippetChars, topK: config.topK,
-      });
+    const literalRoute              = { route: "literal", weight: config.rrf.originalWeight, result: literal };
+    const strong = isStrongSignal(literal.hits, config.strongSignal);
+
+    const fuseLiteral = (partial         )       => {
+      const fusionStartedAt = performance.now();
+      fused = fuseForRecall([literalRoute], config);
+      metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
       prependContext = injectContext(fused, config.injectTokenBudget);
-      status = fused.length > 0 ? "ok" : "no_result";
+      status = fused.length > 0 ? (partial ? "partial" : "ok") : emptyFusionStatus([literalRoute]);
+    };
+
+    if (strong || depth === "literal") {
+      expansionStatus = strong ? "skipped_strong" : config.profile === "speed" ? "skipped_speed" : "skipped_literal";
+      fuseLiteral(false);
     } else {
-      const expansion = await expandQuery(searchQuery, config.expansion, maxAssociations(config));
+      const expansionStartedAt = performance.now();
+      let expansion                                         ;
+      try {
+        expansion = await dependencies.expand(searchQuery, {
+          ...config.expansion,
+          timeoutMs: boundedTimeout(config.expansion.timeoutMs, remainingMs(startedAt, config.maxTotalMs)),
+        }, maxAssociationsForDepth(config, depth));
+      } catch {
+        expansion = {
+          result: null,
+          status: "request_fail",
+          diagnostics: { parseMode: "none", contentChars: 0, failureReason: "request_fail" },
+        };
+      }
+      metrics.expansionMs = Math.round(performance.now() - expansionStartedAt);
       expansionStatus = expansion.status;
+      expansionDiagnostics = expansion.diagnostics;
       if (!expansion.result) {
-        // expansion 失败/超时 → 复用已成功的 literal，不重复检索
-        fused = fuseRoutes([{ route: "literal", weight: config.rrf.originalWeight, result: literal }], {
-          k: config.rrf.k, preferSources: config.preferSources, snippetChars: config.snippetChars, topK: config.topK,
-        });
-        prependContext = injectContext(fused, config.injectTokenBudget);
-        status = fused.length > 0 ? "partial" : "no_result";
+        fuseLiteral(true);
       } else {
-      const routes                                                          = [{ route: "literal", query: searchQuery, weight: config.rrf.originalWeight }];
-      routes.push({ route: "rewrite", query: expansion.result.rewrite, weight: 1 });
-      for (const association of expansion.result.associations) routes.push({ route: `assoc:${association.type}`, query: association.query, weight: 1 });
-      const settled = await Promise.allSettled(routes.map(async (route)                       => {
-        const result = await memorySearch(route.query, {
-          agent, maxResults: maxResultsForProfile(config.profile), minScore: config.minScore,
-          timeoutMs: Math.min(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
-        });
-        traceSearches.push({ route: route.route, query: route.query, hits: result.hits.length, ...result.timing });
-        return { route: route.route, weight: route.weight, result };
-      }));
-      const successful = successfulRoutes(settled);
-      fused = fuseRoutes(successful, {
-        k: config.rrf.k, preferSources: config.preferSources, snippetChars: config.snippetChars, topK: config.topK,
-      });
-      prependContext = injectContext(fused, config.injectTokenBudget);
-      status = statusForFailures(routes.length, successful.length, fused.length > 0, performance.now() - startedAt >= config.maxTotalMs);
+        const routes = buildExpansionSearchRoutes(searchQuery, expansion.result);
+        if (routes.length === 0) {
+          fuseLiteral(true);
+        } else {
+          const expandedSearchStartedAt = performance.now();
+          const routeBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
+          const settled = await Promise.allSettled(routes.map(async (route)                       => {
+            const result = await dependencies.search(route.query, {
+              agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore, timeoutMs: routeBudget,
+            });
+            traceSearches.push({ route: route.route, query: route.query, hits: result.hits.length, ...result.timing });
+            return { route: route.route, weight: route.weight, result };
+          }));
+          metrics.searchMs += Math.round(performance.now() - expandedSearchStartedAt);
+          const successful = [literalRoute, ...successfulRoutes(settled)];
+          const fusionStartedAt = performance.now();
+          fused = fuseForRecall(successful, config);
+          metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
+          prependContext = injectContext(fused, config.injectTokenBudget);
+          status = fused.length > 0
+            ? statusForFailures(routes.length + 1, successful.length, true, remainingMs(startedAt, config.maxTotalMs) === 0)
+            : emptyFusionStatus(successful);
+        }
       }
     }
   } catch (error) {
     api.logger?.error?.(`active-recall fail-open: ${error instanceof Error ? error.message : String(error)}`);
-    status = performance.now() - startedAt >= config.maxTotalMs ? "timeout" : "fail_open";
-  } finally {
-    if (config.trace.enabled) {
-      const injected = prependContext ?? "";
-      await writeTrace({
-        ts: new Date().toISOString(), session, profile: config.profile, status,
-        elapsedMs: Math.round(performance.now() - startedAt), queryChars: rawPrompt.length, cleanedChars: searchQuery.length,
-        trigger: demand.reason                       , expansion: expansionStatus, searches: traceSearches,
-        fusionTop: fused.map(({ path, bestRawScore, rrfScore, routeHits, sourceWeight, finalScore }) => ({ path, bestRawScore, rrfScore, routeHits, sourceWeight, finalScore })),
-        injectedChars: injected.length, injectedTokens: Math.ceil(injected.length / 4),
-      }, config.trace.file, ctx?.workspaceDir).catch((error) => api.logger?.error?.(`active-recall trace failed: ${String(error)}`));
-    }
+    status = remainingMs(startedAt, config.maxTotalMs) === 0 ? "timeout" : "fail_open";
   }
+  emitTrace(status);
   return prependContext ? { prependContext } : undefined;
 }
 
@@ -172,8 +306,8 @@ const plugin = {
   },
 };
 
-export { injectContext, runRecall, statusForFailures };
+export { injectContext, isInternalSession, runRecall, statusForFailures };
 export default plugin;
 
 
-//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active-recall\index.ts
+//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active_recall\index.ts

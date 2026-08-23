@@ -1,0 +1,223 @@
+import type { ExpansionConfig } from "./config.js";
+
+export interface Association {
+  type: string;
+  query: string;
+}
+
+export interface ExpansionResult {
+  rewrite: string;
+  associations: Association[];
+}
+
+export interface ExpandedSearchRoute {
+  route: string;
+  query: string;
+  weight: number;
+}
+
+export type ExpansionFailure =
+  | "timeout"
+  | "request_fail"
+  | "http_fail"
+  | "payload_fail"
+  | "json_syntax_fail"
+  | "schema_fail"
+  | "truncated";
+export type ExpansionStatus = "ok" | "recovered" | ExpansionFailure;
+export type ExpansionParseMode = "none" | "strict" | "fence" | "balanced";
+
+export interface ExpansionDiagnostics {
+  parseMode: ExpansionParseMode;
+  contentChars: number;
+  finishReason?: string;
+  httpStatus?: number;
+}
+
+export interface ExpansionAttempt {
+  result: ExpansionResult | null;
+  status: ExpansionStatus;
+  diagnostics: ExpansionDiagnostics;
+}
+
+function normalizedQuery(query: string): string {
+  return query.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+}
+
+/** Builds only genuinely new expansion routes; the caller reuses its literal result. */
+export function buildExpansionSearchRoutes(original: string, expansion: ExpansionResult): ExpandedSearchRoute[] {
+  const seen = new Set([normalizedQuery(original)]);
+  const routes: ExpandedSearchRoute[] = [];
+  const add = (route: string, query: string): void => {
+    const trimmed = query.trim();
+    const key = normalizedQuery(trimmed);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    routes.push({ route, query: trimmed, weight: 1 });
+  };
+  add("rewrite", expansion.rewrite);
+  for (const association of expansion.associations) add(`assoc:${association.type}`, association.query);
+  return routes;
+}
+
+function expansionPrompt(message: string, max: number): string {
+  return `Given the user message, output JSON only:\n{"rewrite": "<one broadened query covering implied entities/topics>",\n "associations": [{"type": "project|history|decision|preference|entity",\n                   "query": "<searchable query for that axis>"}]}\nConstraints: rewrite <= 40 words; each association query <= 15 words; at most ${max} associations; do not invent facts.\n\nUser message:\n${message}`;
+}
+
+function parseExpansion(value: unknown, max: number): { result: ExpansionResult; relaxedSchema: boolean } | null {
+  if (value === null || typeof value !== "object") return null;
+  const candidate = value as { rewrite?: unknown; associations?: unknown };
+  if (typeof candidate.rewrite !== "string" || candidate.rewrite.trim() === "") return null;
+  if (candidate.associations !== undefined && candidate.associations !== null && !Array.isArray(candidate.associations)) return null;
+  const associations: Association[] = [];
+  let relaxedSchema = !Array.isArray(candidate.associations);
+  for (const item of (Array.isArray(candidate.associations) ? candidate.associations : []).slice(0, max)) {
+    if (item === null || typeof item !== "object") {
+      relaxedSchema = true;
+      continue;
+    }
+    const association = item as { type?: unknown; query?: unknown };
+    if (typeof association.type === "string" && typeof association.query === "string" && association.query.trim()) {
+      associations.push({ type: association.type.trim(), query: association.query.trim() });
+    } else {
+      relaxedSchema = true;
+    }
+  }
+  return { result: { rewrite: candidate.rewrite.trim(), associations }, relaxedSchema };
+}
+
+function stripCodeFence(content: string): string | null {
+  const match = content.trim().match(/^```(?:json)?\s*\r?\n?([\s\S]*?)\r?\n?```$/i);
+  return match ? match[1].trim() : null;
+}
+
+/** Extracts top-level JSON objects while respecting quoted strings and escapes. */
+function balancedJsonObjects(content: string): string[] {
+  const objects: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"' && depth > 0) {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (char === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        objects.push(content.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+  return objects;
+}
+
+function parseExpansionContent(
+  content: string,
+  max: number,
+): { result: ExpansionResult | null; status: "ok" | "recovered" | "json_syntax_fail" | "schema_fail"; parseMode: ExpansionParseMode } {
+  let sawParsedJson = false;
+  const attempts: Array<{ text: string; mode: Exclude<ExpansionParseMode, "none"> }> = [
+    { text: content.trim(), mode: "strict" },
+  ];
+  const fenced = stripCodeFence(content);
+  if (fenced !== null && fenced !== attempts[0].text) attempts.push({ text: fenced, mode: "fence" });
+  const seen = new Set(attempts.map(({ text }) => text));
+  for (const object of balancedJsonObjects(content)) {
+    if (!seen.has(object)) {
+      attempts.push({ text: object, mode: "balanced" });
+      seen.add(object);
+    }
+  }
+
+  for (const attempt of attempts) {
+    try {
+      const value = JSON.parse(attempt.text) as unknown;
+      sawParsedJson = true;
+      const parsed = parseExpansion(value, max);
+      if (!parsed) continue;
+      const recovered = attempt.mode !== "strict" || parsed.relaxedSchema;
+      return { result: parsed.result, status: recovered ? "recovered" : "ok", parseMode: attempt.mode };
+    } catch {
+      // Try the next safe candidate.
+    }
+  }
+  return {
+    result: null,
+    status: sawParsedJson ? "schema_fail" : "json_syntax_fail",
+    parseMode: "none",
+  };
+}
+
+export async function expandQuery(
+  message: string,
+  config: ExpansionConfig,
+  maxAssociations: number,
+): Promise<ExpansionAttempt> {
+  const emptyDiagnostics: ExpansionDiagnostics = { parseMode: "none", contentChars: 0 };
+  try {
+    const apiKey = process.env[config.apiKeyEnv];
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      ...config.headers,
+    };
+    if (apiKey && !Object.keys(headers).some((key) => key.toLowerCase() === "authorization")) {
+      headers.authorization = `Bearer ${apiKey}`;
+    }
+    const response = await fetch(`${config.endpoint}/chat/completions`, {
+      method: "POST",
+      headers,
+      signal: AbortSignal.timeout(config.timeoutMs),
+      body: JSON.stringify({
+        model: config.model,
+        messages: [{ role: "user", content: expansionPrompt(message, maxAssociations) }],
+        max_tokens: config.maxOutputTokens,
+        response_format: { type: "json_object" },
+      }),
+    });
+    if (!response.ok) {
+      return { result: null, status: "http_fail", diagnostics: { ...emptyDiagnostics, httpStatus: response.status } };
+    }
+    let payload: { choices?: Array<{ finish_reason?: unknown; message?: { content?: unknown } }> };
+    try {
+      payload = await response.json() as typeof payload;
+    } catch {
+      return { result: null, status: "payload_fail", diagnostics: emptyDiagnostics };
+    }
+    const choice = payload.choices?.[0];
+    const content = choice?.message?.content;
+    const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : undefined;
+    if (typeof content !== "string") {
+      return { result: null, status: "payload_fail", diagnostics: { ...emptyDiagnostics, finishReason } };
+    }
+    const parsed = parseExpansionContent(content, maxAssociations);
+    const diagnostics: ExpansionDiagnostics = {
+      parseMode: parsed.parseMode,
+      contentChars: content.length,
+      finishReason,
+    };
+    if (!parsed.result && finishReason === "length" && parsed.status === "json_syntax_fail") {
+      return { result: null, status: "truncated", diagnostics };
+    }
+    return { result: parsed.result, status: parsed.status, diagnostics };
+  } catch (error) {
+    const name = error instanceof Error ? error.name : "";
+    return {
+      result: null,
+      status: name === "TimeoutError" || name === "AbortError" ? "timeout" : "request_fail",
+      diagnostics: emptyDiagnostics,
+    };
+  }
+}

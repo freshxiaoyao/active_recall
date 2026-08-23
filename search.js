@@ -28,35 +28,35 @@ function resolveOpenClawEntry()                                         {
   throw new Error("cannot resolve openclaw.mjs (npm global install not found)");
 }
 
-                            
-               
-                
-                
-                       
-                     
-                  
-                 
- 
 
-                               
-                  
-                   
-                  
- 
 
-                               
-                    
-                       
-                    
- 
 
-                                
-                
-                     
-                   
-                    
-                   
- 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 function asNumber(value         , fallback = 0)         {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -91,15 +91,15 @@ function parseHits(output        )              {
 }
 
 /** 进程内 MemorySearchResult 归一化为 SearchHit。 */
-function normalizeMemoryHit(value   
-               
-                     
-                   
-                 
-                       
-                     
-                  
-                   
+function normalizeMemoryHit(value
+
+
+
+
+
+
+
+
  )            {
   return {
     path: value.path,
@@ -112,26 +112,30 @@ function normalizeMemoryHit(value
   };
 }
 
-                            
-                                                                                         
-           
-                   
-                         
-                       
-                     
-                           
-                         
-                      
-                       
-      
-    
- 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 function withTimeout   (promise            , ms        )             {
-  return Promise.race([
-    promise,
-    new Promise   ((_, reject) => setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms)),
-  ]);
+  return new Promise   ((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), Math.max(1, ms));
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
 }
 
 let sdkPromise                                                                                                                                                            ;
@@ -167,17 +171,21 @@ function loadInProcessSdk()                                                     
   return sdkPromise;
 }
 
-/** 进程内检索：gateway 已注册的 memory runtime 直接复用（无 spawn，~毫秒级）。失败或超时(5s)返回 null。 */
-async function tryInProcessSearch(query        , options               )                               {
+/** 进程内检索：gateway 已注册的 memory runtime 直接复用（无 spawn，~毫秒级）。失败或超时返回 null。 */
+async function tryInProcessSearch(query        , options               , timeoutMs        )                               {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`memory search timeout after ${timeoutMs}ms`)), Math.max(1, timeoutMs));
   try {
-    return await withTimeout(inProcessSearchInner(query, options), 5000);
+    return await withTimeout(inProcessSearchInner(query, options, controller.signal), timeoutMs);
   } catch (error) {
     diagLog(`in-process failed: ${error instanceof Error ? error.message : String(error)}`);
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-async function inProcessSearchInner(query        , options               )                               {
+async function inProcessSearchInner(query        , options               , signal              )                               {
   try {
     const sdk = await loadInProcessSdk();
     if (!sdk) { diagLog("sdk unavailable"); return null; }
@@ -188,7 +196,7 @@ async function inProcessSearchInner(query        , options               )      
     if (managerError) diagLog(`manager error: ${managerError}`);
     if (!manager?.search) { diagLog("manager.search missing"); return null; }
     const startedAt = performance.now();
-    const results = await manager.search(query, { maxResults: options.maxResults, minScore: options.minScore });
+    const results = await manager.search(query, { maxResults: options.maxResults, minScore: options.minScore, signal });
     const elapsed = Math.round(performance.now() - startedAt);
     diagLog(`in-process ok: ${elapsed}ms hits=${(results ?? []).length}`);
     return {
@@ -202,11 +210,28 @@ async function inProcessSearchInner(query        , options               )      
   }
 }
 
+/** Best-effort background indexing after a writer adds a memory markdown episode. */
+export async function triggerMemorySync(agentId        )                   {
+  const sdk = await loadInProcessSdk();
+  if (!sdk) return false;
+  const cfgPath = join(homedir(), ".openclaw", "openclaw.json");
+  if (!existsSync(cfgPath)) return false;
+  const cfg = JSON.parse(await readFile(cfgPath, "utf8"))           ;
+  const { manager } = await sdk.getActiveMemorySearchManager({ cfg, agentId });
+  if (!manager?.sync) return false;
+  await manager.sync({ reason: "active-recall-graph-writer" });
+  return true;
+}
+
 /** 先走进程内（gateway 已缓存 manager），失败回退 CLI shell-out。 */
 export async function memorySearch(query        , options               )                        {
-  const inProcess = await tryInProcessSearch(query, options);
+  const startedAt = performance.now();
+  const inProcessBudget = Math.min(options.timeoutMs, Math.max(250, Math.round(options.timeoutMs * 0.6)));
+  const inProcess = await tryInProcessSearch(query, options, inProcessBudget);
   if (inProcess) return inProcess;
-  return cliMemorySearch(query, options);
+  const remaining = Math.floor(options.timeoutMs - (performance.now() - startedAt));
+  if (remaining <= 0) throw new Error(`memory search timeout after ${options.timeoutMs}ms`);
+  return cliMemorySearch(query, { ...options, timeoutMs: remaining });
 }
 
 /** Runs the supported CLI with an argv query, never stdin. */
@@ -255,4 +280,4 @@ function cliMemorySearch(query        , options               )                 
 }
 
 
-//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active-recall\search.ts
+//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active_recall\search.ts

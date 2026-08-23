@@ -1,6 +1,6 @@
 {
   "name": "@openclaw/active-recall",
-  "version": "0.3.1",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "openclaw": {
@@ -8,6 +8,6 @@
   },
   "scripts": {
     "pretest": "node scripts/prepare-tests.mjs",
-    "test": "node --test tests/"
+    "test": "node --test tests/active-recall.test.ts tests/graph-memory.test.ts"
   }
 }

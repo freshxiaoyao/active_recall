@@ -1,0 +1,122 @@
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
+function resolveOpenClawEntry(): { file: string; prefixArgs: string[] } {
+  if (process.platform !== "win32") return { file: "openclaw", prefixArgs: [] };
+  const candidates = [
+    process.env.APPDATA ? join(process.env.APPDATA, "npm", "node_modules", "openclaw", "openclaw.mjs") : "",
+    process.env.NVM_SYMLINK ? join(process.env.NVM_SYMLINK, "node_modules", "openclaw", "openclaw.mjs") : "",
+  ];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return { file: process.execPath, prefixArgs: [candidate] };
+  }
+  throw new Error("cannot resolve openclaw.mjs (npm global install not found)");
+}
+
+export interface SearchHit {
+  path: string;
+  line?: number;
+  score: number;
+  vectorScore?: number;
+  textScore?: number;
+  snippet: string;
+  source: string;
+}
+
+export interface SearchTiming {
+  spawnMs: number;
+  searchMs: number;
+  totalMs: number;
+}
+
+export interface SearchResult {
+  hits: SearchHit[];
+  timing: SearchTiming;
+  rawOutput: string;
+}
+
+export interface SearchOptions {
+  agent: string;
+  maxResults: number;
+  minScore: number;
+  timeoutMs: number;
+  command?: string;
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function normalizeHit(value: unknown): SearchHit | null {
+  if (value === null || typeof value !== "object") return null;
+  const item = value as Record<string, unknown>;
+  if (typeof item.path !== "string" || typeof item.snippet !== "string") return null;
+  return {
+    path: item.path,
+    line: typeof item.line === "number" ? item.line
+      : typeof item.lineStart === "number" ? item.lineStart
+      : typeof item.startLine === "number" ? item.startLine
+      : undefined,
+    score: asNumber(item.score),
+    vectorScore: typeof item.vectorScore === "number" ? item.vectorScore : undefined,
+    textScore: typeof item.textScore === "number" ? item.textScore : undefined,
+    snippet: item.snippet,
+    source: typeof item.source === "string" ? item.source : "memory",
+  };
+}
+
+function parseHits(output: string): SearchHit[] {
+  const parsed = JSON.parse(output) as unknown;
+  const values = Array.isArray(parsed)
+    ? parsed
+    : parsed !== null && typeof parsed === "object" && Array.isArray((parsed as { results?: unknown }).results)
+      ? (parsed as { results: unknown[] }).results
+      : [];
+  return values.map(normalizeHit).filter((hit): hit is SearchHit => hit !== null);
+}
+
+/** Runs the supported CLI with an argv query, never stdin. */
+export function memorySearch(query: string, options: SearchOptions): Promise<SearchResult> {
+  const startedAt = performance.now();
+  let spawnedAt: number | undefined;
+  const override = options.command;
+  const { file: command, prefixArgs } = override
+    ? { file: override, prefixArgs: [] as string[] }
+    : resolveOpenClawEntry();
+  const args = [
+    ...prefixArgs, "memory", "search", "--query", query, "--agent", options.agent,
+    "--max-results", String(options.maxResults), "--min-score", String(options.minScore), "--json",
+  ];
+  return new Promise((resolve, reject) => {
+    const child = execFile(command, args, {
+      encoding: "utf8",
+      timeout: options.timeoutMs,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      const finishedAt = performance.now();
+      if (error) {
+        const detail = stderr ? `${error.message}: ${stderr}` : error.message;
+        reject(new Error(detail, { cause: error }));
+        return;
+      }
+      try {
+        const rawOutput = String(stdout).replace(/^\uFEFF/, "");
+        const spawnMs = Math.max(0, (spawnedAt ?? finishedAt) - startedAt);
+        resolve({
+          hits: parseHits(rawOutput),
+          timing: {
+            spawnMs: Math.round(spawnMs),
+            searchMs: Math.round(Math.max(0, finishedAt - (spawnedAt ?? startedAt))),
+            totalMs: Math.round(finishedAt - startedAt),
+          },
+          rawOutput,
+        });
+      } catch (parseError) {
+        reject(parseError);
+      }
+    });
+    child.once("spawn", () => { spawnedAt = performance.now(); });
+  });
+}

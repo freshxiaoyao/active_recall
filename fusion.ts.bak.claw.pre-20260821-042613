@@ -1,0 +1,75 @@
+import type { SearchHit, SearchResult } from "./search.js";
+
+export interface SearchRoute {
+  route: string;
+  weight: number;
+  result: SearchResult;
+}
+
+export interface FusedHit {
+  path: string;
+  line?: number;
+  bestRawScore: number;
+  rrfScore: number;
+  routeHits: number;
+  sourceWeight: number;
+  finalScore: number;
+  snippet: string;
+  source: string;
+}
+
+export function isStrongSignal(
+  hits: SearchHit[],
+  settings: { enabled: boolean; minScore: number; gap: number },
+): boolean {
+  if (!settings.enabled || hits.length === 0) return false;
+  if (hits.every((hit) => hit.source === "sessions")) return false;
+  const top = hits[0];
+  const nextScore = hits[1]?.score ?? 0;
+  return top.score >= settings.minScore && top.score - nextScore >= settings.gap;
+}
+
+export function successfulRoutes(
+  settled: PromiseSettledResult<SearchRoute>[],
+): SearchRoute[] {
+  return settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+}
+
+export function fuseRoutes(
+  routes: SearchRoute[],
+  settings: { k: number; preferSources: Record<string, number>; snippetChars: number; topK: number },
+): FusedHit[] {
+  const byPath = new Map<string, FusedHit>();
+  for (const route of routes) {
+    route.result.hits.forEach((hit, index) => {
+      const current = byPath.get(hit.path);
+      const contribution = route.weight / (settings.k + index + 1);
+      if (current) {
+        current.bestRawScore = Math.max(current.bestRawScore, hit.score);
+        current.rrfScore += contribution;
+        current.routeHits += 1;
+        if (hit.snippet.length > current.snippet.length) current.snippet = hit.snippet;
+        return;
+      }
+      byPath.set(hit.path, {
+        path: hit.path,
+        bestRawScore: hit.score,
+        rrfScore: contribution,
+        routeHits: 1,
+        sourceWeight: settings.preferSources[hit.source] ?? 1,
+        finalScore: 0,
+        snippet: hit.snippet,
+        source: hit.source,
+        line: hit.line,
+      });
+    });
+  }
+  return [...byPath.values()]
+    .map((hit) => ({
+      ...hit,
+      snippet: hit.snippet.slice(0, settings.snippetChars),
+      finalScore: hit.rrfScore * hit.sourceWeight,
+    }))
+    .sort((a, b) => b.finalScore - a.finalScore || a.path.localeCompare(b.path))
+    .slice(0, settings.topK);
+}

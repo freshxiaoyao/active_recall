@@ -1,45 +1,99 @@
-                                                          
-                                                                    
 
-                                      
-                          
-                             
-                             
-                               
- 
 
-                                  
-                   
-                    
-                
-                                  
-                    
-                          
-                                                         
- 
 
-                               
-                   
-                   
-                            
-                               
-                         
-                            
-                     
-                          
-                             
-                                                                    
-                                           
-                                                                    
-               
-                       
-                   
-                                        
-                                            
-                                   
- 
 
-                                            
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 const profileBudgets                                = {
   speed: 400,
@@ -49,7 +103,7 @@ const profileBudgets                                = {
 
 function record(value         )               {
   return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value                
+    ? value
     : {};
 }
 
@@ -71,6 +125,22 @@ function profileValue(value         )                {
 
 function triggerModeValue(value         )                    {
   return value === "always" || value === "explicit" || value === "on-demand" ? value : "on-demand";
+}
+
+function structuredOutputModeValue(value         )                       {
+  return value === "json_schema" ? "json_schema" : "json_object";
+}
+
+function thinkingModeValue(value         )               {
+  return value === "enabled" || value === "disabled" || value === "omit" ? value : "auto";
+}
+
+function graphProviderValue(value         )                      {
+  return value === "graphiti" || value === "falkordb" || value === "neo4j" ? value : "local-sqlite";
+}
+
+function graphRouteModeValue(value         )                 {
+  return value === "vector" || value === "graph" || value === "hybrid" ? value : "auto";
 }
 
 function stringArray(value         , fallback          )           {
@@ -105,14 +175,18 @@ export function readConfig(pluginConfig         )               {
   const expansion = record(raw.expansion);
   const associations = record(expansion.associations);
   const strongSignal = record(raw.strongSignal);
+  const strongSources = record(strongSignal.sources);
   const qualityGate = record(raw.qualityGate);
+  const semanticGate = record(raw.semanticGate);
+  const graphMemory = record(raw.graphMemory);
+  const graphWriter = record(graphMemory.writer);
   const rrf = record(raw.rrf);
   const trace = record(raw.trace);
 
   return {
     enabled: booleanValue(raw.enabled, true),
     agents: Array.isArray(raw.agents) && raw.agents.every((item) => typeof item === "string")
-      ? raw.agents            
+      ? raw.agents
       : ["main"],
     skipSystemEvents: booleanValue(raw.skipSystemEvents, true),
     trigger: {
@@ -123,26 +197,84 @@ export function readConfig(pluginConfig         )               {
     },
     profile,
     injectTokenBudget: numberValue(raw.injectTokenBudget, profileBudgets[profile]),
-    maxTotalMs: numberValue(raw.maxTotalMs, 25000),
-    searchTimeoutMs: numberValue(raw.searchTimeoutMs, 15000),
+    maxTotalMs: numberValue(raw.maxTotalMs, 5000),
+    searchTimeoutMs: numberValue(raw.searchTimeoutMs, 2200),
     expansion: {
       endpoint: stringValue(expansion.endpoint, "https://api.deepseek.com/v1").replace(/\/$/, ""),
       apiKeyEnv: stringValue(expansion.apiKeyEnv, "DEEPSEEK_API_KEY"),
       model: stringValue(expansion.model, "deepseek-v4-flash"),
       headers: stringMap(expansion.headers),
-      timeoutMs: numberValue(expansion.timeoutMs, 8000),
+      timeoutMs: numberValue(expansion.timeoutMs, 2500),
       maxOutputTokens: numberValue(expansion.maxOutputTokens, 800),
+      responseFormat: structuredOutputModeValue(expansion.responseFormat),
+      thinkingMode: thinkingModeValue(expansion.thinkingMode),
       associations: {
         maxBalanced: numberValue(associations.maxBalanced, 1),
         maxDeep: numberValue(associations.maxDeep, 3),
       },
     },
-    strongSignal: {
-      minScore: numberValue(strongSignal.minScore, 0.85),
-      gap: numberValue(strongSignal.gap, 0.15),
-      enabled: booleanValue(strongSignal.enabled, true),
+    semanticGate: {
+      enabled: booleanValue(semanticGate.enabled, true),
+      model: stringValue(semanticGate.model, stringValue(expansion.model, "deepseek-v4-flash")),
+      timeoutMs: numberValue(semanticGate.timeoutMs, 1800),
+      maxOutputTokens: numberValue(semanticGate.maxOutputTokens, 160),
     },
-    qualityGate: { minBestRawScore: numberValue(qualityGate.minBestRawScore, 0.65) },
+    graphMemory: {
+      enabled: booleanValue(graphMemory.enabled, false),
+      provider: graphProviderValue(graphMemory.provider),
+      file: stringValue(graphMemory.file, "memory/graph-memory/graph-memory-v1.sqlite"),
+      profileFile: stringValue(graphMemory.profileFile, "memory/profile-memory.json"),
+      vectorDir: stringValue(graphMemory.vectorDir, "memory/graph-memory/episodes"),
+      readTimeoutMs: numberValue(graphMemory.readTimeoutMs, 120),
+      writeTimeoutMs: numberValue(graphMemory.writeTimeoutMs, 12000),
+      routeMode: graphRouteModeValue(graphMemory.routeMode),
+      maxGraphResults: Math.max(1, Math.round(numberValue(graphMemory.maxGraphResults, 4))),
+      maxHops: Math.max(1, Math.min(4, Math.round(numberValue(graphMemory.maxHops, 2)))),
+      profileBudget: numberValue(graphMemory.profileBudget, 160),
+      vectorBudget: numberValue(graphMemory.vectorBudget, 600),
+      graphBudget: numberValue(graphMemory.graphBudget, 300),
+      writer: {
+        enabled: booleanValue(graphWriter.enabled, true),
+        model: stringValue(graphWriter.model, stringValue(expansion.model, "deepseek-v4-flash")),
+        timeoutMs: numberValue(graphWriter.timeoutMs, 8000),
+        maxOutputTokens: numberValue(graphWriter.maxOutputTokens, 1200),
+        maxInputChars: numberValue(graphWriter.maxInputChars, 12000),
+        traceFile: stringValue(graphWriter.traceFile, "memory/graph-memory/write-traces.jsonl"),
+      },
+    },
+    strongSignal: (() => {
+      const minScore = numberValue(strongSignal.minScore, 0.85);
+      const gap = numberValue(strongSignal.gap, 0.15);
+      const calibration = (name        , defaultMin        , defaultGap        )                          => {
+        const source = record(strongSources[name]);
+        return {
+          minScore: numberValue(source.minScore, Math.min(1, defaultMin)),
+          gap: numberValue(source.gap, Math.min(1, defaultGap)),
+        };
+      };
+      return {
+        minScore,
+        gap,
+        enabled: booleanValue(strongSignal.enabled, true),
+        sources: {
+          memory: calibration("memory", minScore, gap),
+          documents: calibration("documents", minScore + 0.02, gap),
+          wiki: calibration("wiki", minScore + 0.02, gap),
+          sessions: calibration("sessions", Math.round((minScore + 0.07) * 100) / 100, Math.round((gap + 0.05) * 100) / 100),
+          default: calibration("default", minScore + 0.02, gap),
+        },
+      };
+    })(),
+    qualityGate: (() => {
+      const legacyHigh = numberValue(qualityGate.minBestRawScore, 0.65);
+      const highRawScore = numberValue(qualityGate.highRawScore, legacyHigh);
+      return {
+        minBestRawScore: highRawScore,
+        highRawScore,
+        mediumRawScore: numberValue(qualityGate.mediumRawScore, numberValue(raw.minScore, 0.55)),
+        minRouteHits: Math.max(1, Math.round(numberValue(qualityGate.minRouteHits, 2))),
+      };
+    })(),
     rrf: {
       k: numberValue(rrf.k, 20),
       originalWeight: numberValue(rrf.originalWeight, 2),
@@ -161,16 +293,29 @@ export function readConfig(pluginConfig         )               {
 }
 
 export function maxAssociations(config              )         {
-  if (config.profile === "deep") return config.expansion.associations.maxDeep;
-  if (config.profile === "balanced") return config.expansion.associations.maxBalanced;
+  return maxAssociationsForDepth(config, depthForProfile(config.profile));
+}
+
+export function depthForProfile(profile               )              {
+  if (profile === "speed") return "literal";
+  return profile;
+}
+
+export function maxAssociationsForDepth(config              , depth             )         {
+  if (depth === "deep") return config.expansion.associations.maxDeep;
+  if (depth === "balanced") return config.expansion.associations.maxBalanced;
   return 0;
 }
 
 export function maxResultsForProfile(profile               )         {
-  if (profile === "speed") return 3;
-  if (profile === "deep") return 8;
+  return maxResultsForDepth(depthForProfile(profile));
+}
+
+export function maxResultsForDepth(depth             )         {
+  if (depth === "deep") return 8;
+  if (depth === "literal") return 3;
   return 5;
 }
 
 
-//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active-recall\config.ts
+//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active_recall\config.ts

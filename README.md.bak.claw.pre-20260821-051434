@@ -1,0 +1,151 @@
+# Active Recall
+
+一个不占 memory slot 的 **OpenClaw 薄插件**：先用零 LLM 成本的高精度门控判断当前消息是否依赖历史记忆；只有需要时，才在 `before_prompt_build` 阶段做「结构化 query expansion + 多路检索 RRF 融合」，把本地记忆（memory-core / BGE-M3 + BM25）里相关的背景注入到 prompt 上下文。
+
+> 定位：**薄插件**，复用现有 memory-core 后端，不自建索引、不抢 memory slot。默认是**按需召回**：普通独立问题直接跳过；明确回忆、跨会话延续、历史偏好或「那个项目现在怎样」这类依赖旧上下文的问题才检索、融合、注入。
+
+## 它解决什么问题
+
+默认的 memory 检索是**单查询**：拿你的原话直接搜一次。遇到模糊问题（不点名项目名、不点出实体）就抓瞎——比如「那个审批插件现在推进到哪一步了」，它得自己联想出 `human-gate`、`flood detector`、`P1 评估` 这些没明说的东西才搜得到。
+
+Active Recall 的做法：先让 LLM 把问题**结构化展开**成「改写 + 多个联想查询」，再**多路并行检索**，用 **RRF（Reciprocal Rank Fusion）** 融合排序，最后注入。
+
+## 核心流程
+
+```
+用户消息
+  │
+  ▼
+⓪ 按需触发门控（本地规则，零 LLM / 零检索）
+  │
+  ├─ 不依赖历史记忆 ──► 直接跳过，不注入
+  │
+  └─ 需要记忆
+       ▼
+① literal 搜索（原句直搜）
+  │
+  ├─ 命中「强信号」(top1≥0.85 且 gap≥0.15) ──► 直接融合注入（跳过 expansion，省一次 LLM 调用）
+  │
+  └─ 否则
+       ▼
+② 结构化 Query Expansion（单次 LLM 调用，输出 JSON）
+       { "rewrite": "...", "associations": [{"type":"project","query":"..."}, ...] }
+       │
+       ▼
+③ 多路并行检索：literal + rewrite + assoc:project + assoc:history + ...
+       │
+       ▼
+④ RRF 融合排序 → 注入 <recall-context> 块到 prompt
+```
+
+关键约束：**expansion 任何 profile 下只允许 1 次 LLM round-trip**（「头脑风暴 N 角度再逐角度搜」在实验里 6/6 超时，是死路，禁了）。
+
+## 三种 profile
+
+| profile | expansion | 联想轴数 | 检索结果数 | 注入 token 预算 |
+|---------|-----------|---------|-----------|----------------|
+| `speed` | ❌ 跳过 | 0 | 3 | ~400 |
+| `balanced`（默认） | ✅ | 1 | 5 | ~800 |
+| `deep` | ✅ | 3 | 8 | ~1200 |
+
+## 关键设计
+
+- **默认按需召回**：`trigger.mode="on-demand"` 只对明确回忆意图、跨会话历史引用、已保存偏好和模糊历史实体触发；普通消息在任何检索或 expansion 之前返回。
+- **手动控制**：消息以 `/recall`、`/memory`、`回忆：` 或 `记忆：` 开头可强制召回；以 `/no-recall`、`/no-memory` 或 `不查记忆：` 开头可强制跳过。控制前缀不会进入检索 query。
+- **严格质量门**：后端的 keyword fallback 可能返回低于 `minScore` 的结果，因此融合前再次硬过滤 `bestRawScore >= 0.65`，避免低分结果被注入。
+- **真正的多路共识**：同一路由、同一路径的重复 chunk 只贡献一次；`routeHits` 只统计不同查询路由。相同文件保留最高分 chunk，并同步更新 snippet、行号和来源。
+- **相关性加权 RRF**：RRF 贡献按 raw score 做温和折算（默认 blend `0.5`），避免低分重复结果压过高相关候选；相同最终分再按 raw score 排序。
+- **复用 literal**：首轮 literal 结果同时用于 strong-signal gate 和最终融合；expansion 成功后不再重复搜索 literal，相同 expansion query 也会去重。
+- **安全宽松解析**：严格 JSON 失败后依次尝试去除 Markdown fence、按字符串/转义感知的括号平衡扫描提取完整对象；不会用易误截嵌套对象的简单正则。`rewrite` 有效但 associations 缺失或部分非法时降级为空数组继续使用。
+- **fail-open 铁律**：超时 / 失败绝不阻塞主回复。expansion 失败或超时 → 复用 literal 结果直接注入（不重复检索），最坏情况返回 `undefined` 让主回复正常走。
+- **进程内检索**：优先复用 gateway 里已注册的 memory runtime（`getActiveMemorySearchManager`），无 CLI spawn，单次 ~秒级；不可用时自动 fallback 到 `openclaw memory search` CLI。
+- **强信号 gate**：literal 命中 top1≥0.85 且与次高分差 ≥0.15 时跳过 expansion——「命中 = expansion 不必要，≠ memory 不必要」。
+- **跳过内部会话**：active-memory 子会话、dreaming、cron / heartbeat 会话和 system event 不触发，避免内部摘要任务污染召回与 trace。
+- **trace 落盘**：每次运行写 `memory/recall-traces.jsonl`；expansion 会区分 request / HTTP / payload / JSON / schema / truncation 失败，并记录 parse mode、`finish_reason`、内容长度和 HTTP 状态，但不保存原始 LLM 内容。
+
+## 安装
+
+```bash
+openclaw plugins install   # 本地文件插件：指向本目录 index.ts
+```
+
+`openclaw.json` 只需加：
+
+```json
+{
+  "plugins": {
+    "allow": ["active-recall"],
+    "entries": { "active-recall": { "enabled": true } }
+  }
+}
+```
+
+**注意**：与 `active-memory` 互斥（二者都在 `before_prompt_build` 注入记忆上下文）。上 Active Recall 前先禁用 active-memory 做 A/B。
+
+## 配置
+
+全部走 `plugins.entries.active-recall.config`，带默认值（`openclaw.plugin.json` 的 `configSchema`）：
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `enabled` | `true` | 总开关 |
+| `agents` | `["main"]` | 生效的 agent 列表 |
+| `skipSystemEvents` | `true` | 跳过系统事件 |
+| `trigger.mode` | `"on-demand"` | `on-demand`（自动按需）/ `explicit`（仅手动或自定义关键词）/ `always`（兼容旧行为） |
+| `trigger.explicitPrefixes` | `[/recall, /memory, 回忆：, 记忆：]` | 强制召回前缀；命中后从检索 query 移除 |
+| `trigger.suppressPrefixes` | `[/no-recall, /no-memory, 不查记忆：]` | 强制跳过前缀 |
+| `trigger.additionalKeywords` | `[]` | 额外触发关键词；大小写不敏感，按字面包含匹配 |
+| `profile` | `"balanced"` | `speed` / `balanced` / `deep` |
+| `injectTokenBudget` | profile 决定 | 注入 token 预算 |
+| `maxTotalMs` | `25000` | 整轮硬超时（fail-open 触发线） |
+| `searchTimeoutMs` | `15000` | 单路检索超时 |
+| `minScore` | `0.55` | 检索最低分 |
+| `topK` | `3` | 质量门通过后最多注入前 K 条 |
+| `snippetChars` | `200` | 每条命中 snippet 长度 |
+| `expansion.endpoint` | `https://api.deepseek.com/v1` | expansion LLM 端点 |
+| `expansion.apiKeyEnv` | `DEEPSEEK_API_KEY` | 从哪个环境变量读 key |
+| `expansion.model` | `deepseek-v4-flash` | expansion 模型 |
+| `expansion.timeoutMs` | `8000` | expansion 硬超时 |
+| `expansion.maxOutputTokens` | `800` | expansion 最大输出（推理模型需留 reasoning 预算） |
+| `expansion.associations.maxBalanced` | `1` | balanced 联想轴数 |
+| `expansion.associations.maxDeep` | `3` | deep 联想轴数 |
+| `strongSignal.enabled` | `true` | 强信号 gate 开关 |
+| `strongSignal.minScore` | `0.85` | top1 阈值 |
+| `strongSignal.gap` | `0.15` | top1 与次高分差 |
+| `qualityGate.minBestRawScore` | `0.65` | 插件侧不可绕过的最终 raw score 下限 |
+| `rrf.k` | `20` | RRF 常数；小候选集下增强 rank 区分度 |
+| `rrf.originalWeight` | `2.0` | literal 原句权重 |
+| `rrf.rawScoreBlend` | `0.5` | raw score 对每路 RRF 贡献的折算比例，范围 0–1 |
+| `preferSources.memory/wiki/sessions` | `1.0` | 各来源加权 |
+| `trace.enabled` | `true` | trace 开关 |
+| `trace.file` | `memory/recall-traces.jsonl` | trace 路径 |
+
+## 模块结构
+
+```
+index.ts        主流程编排：hook 注册、按需 gate、强信号 gate、多路检索、注入、trace
+demand.ts       零 LLM 按需触发判定 + 强制召回/跳过前缀
+clean-prompt.ts 清洗 prompt + 识别 system event
+config.ts       配置读取（默认值 + profile 预算）
+expansion.ts    LLM query expansion + 安全宽松 JSON 恢复（rewrite + typed associations）
+search.ts       检索（进程内优先 + CLI fallback）
+fusion.ts       路由内去重 + strict quality gate + raw-aware RRF + 强信号判定
+trace.ts        trace 落盘（含 source / routes / occurrences，便于后续标注调优）
+```
+
+## 测试
+
+```bash
+npm test   # 生成 JS 后运行 node --test tests/
+```
+
+## 已知限制 / 待办
+
+- **expansion 仍依赖 DeepSeek 稳定性**：JSON fence、前后杂文和部分 schema 偏差会本地恢复；无法恢复时按 `timeout` / `request_fail` / `http_fail` / `payload_fail` / `json_syntax_fail` / `schema_fail` / `truncated` 分类，并 fail-open 退化为 literal-only。默认不自动重试，避免额外 LLM 成本和撞上总超时。
+- **最终阈值仍需人工标注集**：当前 `0.65` 质量门和 raw-aware RRF 来自历史 trace 的保守校准；后续应以 Hit@1、MRR@3 和 false-injection rate 做定量迭代。
+- `disableActiveMemoryHint` 配置项已在 schema 声明，但当前版本靠硬编码正则跳过内部会话（未读取该配置项）。
+
+## 背景
+
+- 设计定论见 `specs/active-recall-plugin-spec.md`（v0.2）
+- 联想式 expansion 的 A/B 实验结论见 `memory/exp-expansion-runs-2026-08-16.md`（实验组 6/6 超时，单次结构化 expansion 是唯一可行路线）

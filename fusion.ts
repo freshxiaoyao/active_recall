@@ -13,6 +13,8 @@ export interface FusedHit {
   rrfScore: number;
   routeHits: number;
   sourceWeight: number;
+  finalRankScore: number;
+  /** Compatibility alias for existing trace consumers. */
   finalScore: number;
   snippet: string;
   source: string;
@@ -27,6 +29,7 @@ export interface FusionSettings {
   topK: number;
   minRawScore?: number;
   rawScoreBlend?: number;
+  qualityGate?: { highRawScore: number; mediumRawScore: number; minRouteHits: number };
 }
 
 export function canonicalPath(path: string): string {
@@ -52,30 +55,50 @@ function distinctPathHits(hits: SearchHit[], minRawScore: number): Array<{ hit: 
     .map(({ hit, occurrences }) => ({ hit, occurrences }));
 }
 
+function strongCalibrationKey(hit: SearchHit): string {
+  if (hit.source !== "memory") return hit.source;
+  const normalizedPath = hit.path.trim().replace(/\\/g, "/").replace(/^\.\//, "").toLocaleLowerCase();
+  const isCuratedMemory = normalizedPath === "memory.md"
+    || normalizedPath.endsWith("/memory.md")
+    || normalizedPath.startsWith("memory/")
+    || normalizedPath.includes("/memory/");
+  return isCuratedMemory ? "memory" : "documents";
+}
+
 export function isStrongSignal(
   hits: SearchHit[],
-  settings: { enabled: boolean; minScore: number; gap: number },
+  settings: {
+    enabled: boolean;
+    minScore: number;
+    gap: number;
+    sources?: Record<string, { minScore: number; gap: number }>;
+  },
 ): boolean {
   if (!settings.enabled || hits.length === 0) return false;
   const unique = distinctPathHits(hits, Number.NEGATIVE_INFINITY)
     .map(({ hit }) => hit)
     .sort((a, b) => b.score - a.score);
   const top = unique[0];
-  if (!top || top.source === "sessions") return false;
+  if (!top) return false;
+  const calibrationKey = strongCalibrationKey(top);
+  const calibration = settings.sources?.[calibrationKey] ?? settings.sources?.[top.source] ?? settings.sources?.default ?? settings;
   const nextScore = unique[1]?.score ?? 0;
-  return top.score >= settings.minScore && top.score - nextScore >= settings.gap;
+  return top.score >= calibration.minScore && top.score - nextScore >= calibration.gap;
 }
 
-export function successfulRoutes(
-  settled: PromiseSettledResult<SearchRoute>[],
-): SearchRoute[] {
+export function passesQualityGate(
+  hit: Pick<FusedHit, "bestRawScore" | "routeHits">,
+  gate: { highRawScore: number; mediumRawScore: number; minRouteHits: number },
+): boolean {
+  return hit.bestRawScore >= gate.highRawScore
+    || (hit.bestRawScore >= gate.mediumRawScore && hit.routeHits >= gate.minRouteHits);
+}
+
+export function successfulRoutes(settled: PromiseSettledResult<SearchRoute>[]): SearchRoute[] {
   return settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
 }
 
-export function fuseRoutes(
-  routes: SearchRoute[],
-  settings: FusionSettings,
-): FusedHit[] {
+export function fuseRoutes(routes: SearchRoute[], settings: FusionSettings): FusedHit[] {
   const byPath = new Map<string, FusedHit>();
   for (const route of routes) {
     distinctPathHits(route.result.hits, settings.minRawScore ?? Number.NEGATIVE_INFINITY)
@@ -108,6 +131,7 @@ export function fuseRoutes(
           rrfScore: baseContribution,
           routeHits: 1,
           sourceWeight: settings.preferSources[hit.source] ?? 1,
+          finalRankScore: contribution,
           finalScore: contribution,
           snippet: hit.snippet,
           source: hit.source,
@@ -121,8 +145,10 @@ export function fuseRoutes(
     .map((hit) => ({
       ...hit,
       snippet: hit.snippet.slice(0, settings.snippetChars),
+      finalRankScore: hit.finalScore * hit.sourceWeight,
       finalScore: hit.finalScore * hit.sourceWeight,
     }))
-    .sort((a, b) => b.finalScore - a.finalScore || b.bestRawScore - a.bestRawScore || a.path.localeCompare(b.path))
+    .filter((hit) => !settings.qualityGate || passesQualityGate(hit, settings.qualityGate))
+    .sort((a, b) => b.finalRankScore - a.finalRankScore || b.bestRawScore - a.bestRawScore || a.path.localeCompare(b.path))
     .slice(0, settings.topK);
 }

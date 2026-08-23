@@ -13,5 +13,7 @@ await Promise.all(sourceFiles.map(async (name) => {
   const sourcePath = join(pluginDir, name);
   const targetPath = sourcePath.replace(/\.ts$/, ".js");
   const source = await readFile(sourcePath, "utf8");
-  await writeFile(targetPath, stripTypeScriptTypes(source, { mode: "strip", sourceUrl: sourcePath }), "utf8");
+  const generated = stripTypeScriptTypes(source, { mode: "strip", sourceUrl: sourcePath })
+    .replace(/[ \t]+$/gm, "");
+  await writeFile(targetPath, generated, "utf8");
 }));

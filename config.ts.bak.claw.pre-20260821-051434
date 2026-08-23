@@ -1,0 +1,173 @@
+export type RecallProfile = "speed" | "balanced" | "deep";
+export type RecallTriggerMode = "always" | "on-demand" | "explicit";
+
+export interface RecallTriggerConfig {
+  mode: RecallTriggerMode;
+  explicitPrefixes: string[];
+  suppressPrefixes: string[];
+  additionalKeywords: string[];
+}
+
+export interface ExpansionConfig {
+  endpoint: string;
+  apiKeyEnv: string;
+  model: string;
+  headers: Record<string, string>;
+  timeoutMs: number;
+  maxOutputTokens: number;
+  associations: { maxBalanced: number; maxDeep: number };
+}
+
+export interface RecallConfig {
+  enabled: boolean;
+  agents: string[];
+  skipSystemEvents: boolean;
+  trigger: RecallTriggerConfig;
+  profile: RecallProfile;
+  injectTokenBudget: number;
+  maxTotalMs: number;
+  searchTimeoutMs: number;
+  expansion: ExpansionConfig;
+  strongSignal: { minScore: number; gap: number; enabled: boolean };
+  qualityGate: { minBestRawScore: number };
+  rrf: { k: number; originalWeight: number; rawScoreBlend: number };
+  topK: number;
+  snippetChars: number;
+  minScore: number;
+  preferSources: Record<string, number>;
+  trace: { enabled: boolean; file: string };
+  disableActiveMemoryHint: boolean;
+}
+
+type ConfigRecord = Record<string, unknown>;
+
+const profileBudgets: Record<RecallProfile, number> = {
+  speed: 400,
+  balanced: 800,
+  deep: 1200,
+};
+
+function record(value: unknown): ConfigRecord {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as ConfigRecord
+    : {};
+}
+
+function stringValue(value: unknown, fallback: string): string {
+  return typeof value === "string" && value.length > 0 ? value : fallback;
+}
+
+function numberValue(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function booleanValue(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function profileValue(value: unknown): RecallProfile {
+  return value === "speed" || value === "deep" || value === "balanced" ? value : "balanced";
+}
+
+function triggerModeValue(value: unknown): RecallTriggerMode {
+  return value === "always" || value === "explicit" || value === "on-demand" ? value : "on-demand";
+}
+
+function stringArray(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) return [...fallback];
+  const output = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return output.length === value.length ? output : [...fallback];
+}
+
+function stringMap(value: unknown): Record<string, string> {
+  const output: Record<string, string> = {};
+  for (const [key, item] of Object.entries(record(value))) {
+    if (typeof item === "string") output[key] = item;
+  }
+  return output;
+}
+
+function numberMap(value: unknown, defaults: Record<string, number>): Record<string, number> {
+  const output = { ...defaults };
+  for (const [key, item] of Object.entries(record(value))) {
+    if (typeof item === "number" && Number.isFinite(item) && item >= 0) output[key] = item;
+  }
+  return output;
+}
+
+export function readConfig(pluginConfig: unknown): RecallConfig {
+  const raw = record(pluginConfig);
+  const profile = profileValue(raw.profile);
+  const trigger = record(raw.trigger);
+  const expansion = record(raw.expansion);
+  const associations = record(expansion.associations);
+  const strongSignal = record(raw.strongSignal);
+  const qualityGate = record(raw.qualityGate);
+  const rrf = record(raw.rrf);
+  const trace = record(raw.trace);
+
+  return {
+    enabled: booleanValue(raw.enabled, true),
+    agents: Array.isArray(raw.agents) && raw.agents.every((item) => typeof item === "string")
+      ? raw.agents as string[]
+      : ["main"],
+    skipSystemEvents: booleanValue(raw.skipSystemEvents, true),
+    trigger: {
+      mode: triggerModeValue(trigger.mode),
+      explicitPrefixes: stringArray(trigger.explicitPrefixes, ["/recall", "/memory", "回忆：", "记忆："]),
+      suppressPrefixes: stringArray(trigger.suppressPrefixes, ["/no-recall", "/no-memory", "不查记忆："]),
+      additionalKeywords: stringArray(trigger.additionalKeywords, []),
+    },
+    profile,
+    injectTokenBudget: numberValue(raw.injectTokenBudget, profileBudgets[profile]),
+    maxTotalMs: numberValue(raw.maxTotalMs, 25000),
+    searchTimeoutMs: numberValue(raw.searchTimeoutMs, 15000),
+    expansion: {
+      endpoint: stringValue(expansion.endpoint, "https://api.deepseek.com/v1").replace(/\/$/, ""),
+      apiKeyEnv: stringValue(expansion.apiKeyEnv, "DEEPSEEK_API_KEY"),
+      model: stringValue(expansion.model, "deepseek-v4-flash"),
+      headers: stringMap(expansion.headers),
+      timeoutMs: numberValue(expansion.timeoutMs, 8000),
+      maxOutputTokens: numberValue(expansion.maxOutputTokens, 800),
+      associations: {
+        maxBalanced: numberValue(associations.maxBalanced, 1),
+        maxDeep: numberValue(associations.maxDeep, 3),
+      },
+    },
+    strongSignal: {
+      minScore: numberValue(strongSignal.minScore, 0.85),
+      gap: numberValue(strongSignal.gap, 0.15),
+      enabled: booleanValue(strongSignal.enabled, true),
+    },
+    qualityGate: { minBestRawScore: numberValue(qualityGate.minBestRawScore, 0.65) },
+    rrf: {
+      k: numberValue(rrf.k, 20),
+      originalWeight: numberValue(rrf.originalWeight, 2),
+      rawScoreBlend: numberValue(rrf.rawScoreBlend, 0.5),
+    },
+    topK: numberValue(raw.topK, 3),
+    snippetChars: numberValue(raw.snippetChars, 200),
+    minScore: numberValue(raw.minScore, 0.55),
+    preferSources: numberMap(raw.preferSources, { memory: 1, wiki: 1, sessions: 1 }),
+    trace: {
+      enabled: booleanValue(trace.enabled, true),
+      file: stringValue(trace.file, "memory/recall-traces.jsonl"),
+    },
+    disableActiveMemoryHint: booleanValue(raw.disableActiveMemoryHint, true),
+  };
+}
+
+export function maxAssociations(config: RecallConfig): number {
+  if (config.profile === "deep") return config.expansion.associations.maxDeep;
+  if (config.profile === "balanced") return config.expansion.associations.maxBalanced;
+  return 0;
+}
+
+export function maxResultsForProfile(profile: RecallProfile): number {
+  if (profile === "speed") return 3;
+  if (profile === "deep") return 8;
+  return 5;
+}
