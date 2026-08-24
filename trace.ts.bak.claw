@@ -7,6 +7,7 @@ import type { SearchTiming } from "./search.js";
 import type { RecallTriggerReason } from "./demand.js";
 import type { ExpansionParseMode, ExpansionStatus } from "./expansion.js";
 import type { RecallDepth } from "./config.js";
+import type { RecallRoute } from "./graph-types.js";
 import type { SemanticGateStatus } from "./semantic-gate.js";
 
 export interface TraceRecord {
@@ -21,10 +22,19 @@ export interface TraceRecord {
   expansionMs: number;
   searchMs: number;
   fusionMs: number;
+  vectorMs?: number;
+  graphMs?: number;
+  profileMs?: number;
   queryChars: number;
   cleanedChars: number;
   trigger: RecallTriggerReason;
   recallDepth: RecallDepth;
+  routeDecision?: RecallRoute;
+  fallbackReason?: string;
+  graphTimedOut?: boolean;
+  vectorHits?: number;
+  graphHits?: number;
+  profileHits?: number;
   gateDecision: "yes" | "no" | "uncertain";
   gateStatus?: SemanticGateStatus | "not_run";
   gateReason?: string;
@@ -48,6 +58,9 @@ export interface TraceRecord {
   fusionTop: Array<Pick<FusedHit, "path" | "bestRawScore" | "rrfScore" | "routeHits" | "sourceWeight" | "finalRankScore" | "finalScore" | "source" | "routes" | "occurrences">>;
   injectedChars: number;
   injectedTokens: number;
+  injectedProfileChars?: number;
+  injectedVectorChars?: number;
+  injectedGraphChars?: number;
 }
 
 export async function writeTrace(trace: TraceRecord, file: string, workspaceDir?: string): Promise<void> {

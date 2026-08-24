@@ -1,0 +1,328 @@
+import { createHash } from "node:crypto";
+import { mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { entityAliases, normalizeEntityAlias, queryAliasScore } from "./entity-resolution.js";
+import type { GraphEpisodeInput, GraphProvider, GraphRetrieveOptions, GraphWriteResult, RelationType } from "./graph-types.js";
+import type { SearchHit, SearchResult } from "./search.js";
+
+interface EntityRow {
+  id: string;
+  canonical_name: string;
+  type: string;
+}
+
+interface AliasRow extends EntityRow {
+  alias: string;
+  alias_norm: string;
+}
+
+interface EdgeRow {
+  id: string;
+  from_entity_id: string;
+  to_entity_id: string;
+  relation_type: RelationType;
+  valid_from: string;
+  valid_to: string | null;
+  episode_id: string;
+  confidence: number;
+  from_name: string;
+  to_name: string;
+  source_path: string | null;
+}
+
+interface WalkState {
+  entityId: string;
+  depth: number;
+  seedScore: number;
+  visitedEntities: Set<string>;
+  visitedEdges: Set<string>;
+  labels: string[];
+  episodeIds: string[];
+  sourcePath?: string;
+  confidence: number;
+}
+
+const EXCLUSIVE_TEMPORAL_RELATIONS = new Set<RelationType>(["prefers"]);
+
+function stableId(prefix: string, value: string): string {
+  return `${prefix}_${createHash("sha256").update(value, "utf8").digest("hex").slice(0, 24)}`;
+}
+
+function clampConfidence(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.85;
+}
+
+function isoOr(value: string | undefined, fallback: string): string {
+  if (!value) return fallback;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallback;
+}
+
+export function resolveGraphDatabasePath(file: string, workspaceDir?: string): string {
+  return isAbsolute(file) ? file : resolve(workspaceDir ?? join(homedir(), ".openclaw", "workspace"), file);
+}
+
+export class SqliteGraphProvider implements GraphProvider {
+  readonly file: string;
+  private db?: DatabaseSync;
+
+  constructor(file: string, workspaceDir?: string) {
+    this.file = resolveGraphDatabasePath(file, workspaceDir);
+  }
+
+  private async database(): Promise<DatabaseSync> {
+    if (this.db) return this.db;
+    await mkdir(dirname(this.file), { recursive: true });
+    const db = new DatabaseSync(this.file);
+    db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1000;");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS episodes (
+        id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        run_id TEXT,
+        occurred_at TEXT NOT NULL,
+        source TEXT NOT NULL,
+        source_path TEXT,
+        summary TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS entities (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        canonical_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS entity_aliases (
+        alias_norm TEXT PRIMARY KEY,
+        alias TEXT NOT NULL,
+        entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS edges (
+        id TEXT PRIMARY KEY,
+        from_entity_id TEXT NOT NULL REFERENCES entities(id),
+        relation_type TEXT NOT NULL,
+        to_entity_id TEXT NOT NULL REFERENCES entities(id),
+        valid_from TEXT NOT NULL,
+        valid_to TEXT,
+        episode_id TEXT NOT NULL REFERENCES episodes(id),
+        confidence REAL NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_edges_from_active ON edges(from_entity_id, relation_type, valid_to);
+      CREATE INDEX IF NOT EXISTS idx_edges_to_active ON edges(to_entity_id, relation_type, valid_to);
+      CREATE INDEX IF NOT EXISTS idx_edges_episode ON edges(episode_id);
+    `);
+    this.db = db;
+    return db;
+  }
+
+  private mergeEntity(db: DatabaseSync, targetId: string, duplicateId: string): void {
+    if (targetId === duplicateId) return;
+    db.prepare("UPDATE edges SET from_entity_id = ? WHERE from_entity_id = ?").run(targetId, duplicateId);
+    db.prepare("UPDATE edges SET to_entity_id = ? WHERE to_entity_id = ?").run(targetId, duplicateId);
+    db.prepare("UPDATE OR IGNORE entity_aliases SET entity_id = ? WHERE entity_id = ?").run(targetId, duplicateId);
+    db.prepare("DELETE FROM entity_aliases WHERE entity_id = ?").run(duplicateId);
+    db.prepare("DELETE FROM entities WHERE id = ?").run(duplicateId);
+  }
+
+  async ingestEpisode(episode: GraphEpisodeInput): Promise<GraphWriteResult> {
+    const db = await this.database();
+    const existing = db.prepare("SELECT id FROM episodes WHERE id = ?").get(episode.id) as { id?: string } | undefined;
+    if (existing?.id) {
+      return { episodeId: episode.id, idempotent: true, entitiesCreated: 0, entityMerges: 0, relationsCreated: 0, temporalInvalidations: 0 };
+    }
+
+    const now = new Date().toISOString();
+    const occurredAt = isoOr(episode.occurredAt, now);
+    let entitiesCreated = 0;
+    let entityMerges = 0;
+    let relationsCreated = 0;
+    let temporalInvalidations = 0;
+    const entityIds = new Map<string, string>();
+
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.prepare(`INSERT INTO episodes(id, session_key, run_id, occurred_at, source, source_path, summary, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(episode.id, episode.sessionKey, episode.runId ?? null, occurredAt, episode.source, episode.sourcePath ?? null, episode.summary, now);
+
+      for (const entity of episode.entities) {
+        const aliases = entityAliases(entity);
+        if (aliases.length === 0) continue;
+        const matchedIds: string[] = [];
+        for (const alias of aliases) {
+          const row = db.prepare("SELECT entity_id FROM entity_aliases WHERE alias_norm = ?").get(alias.normalized) as { entity_id?: string } | undefined;
+          if (row?.entity_id && !matchedIds.includes(row.entity_id)) matchedIds.push(row.entity_id);
+        }
+        let entityId = matchedIds[0];
+        if (!entityId) {
+          entityId = stableId("ent", `${entity.type}:${aliases[0].normalized}`);
+          db.prepare("INSERT OR IGNORE INTO entities(id, type, canonical_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+            .run(entityId, entity.type, entity.name.trim(), now, now);
+          entitiesCreated += 1;
+        } else {
+          db.prepare("UPDATE entities SET updated_at = ? WHERE id = ?").run(now, entityId);
+        }
+        for (const duplicateId of matchedIds.slice(1)) {
+          this.mergeEntity(db, entityId, duplicateId);
+          entityMerges += 1;
+        }
+        for (const alias of aliases) {
+          db.prepare("INSERT OR IGNORE INTO entity_aliases(alias_norm, alias, entity_id) VALUES (?, ?, ?)")
+            .run(alias.normalized, alias.alias, entityId);
+          entityIds.set(alias.normalized, entityId);
+        }
+      }
+
+      for (const relation of episode.relations) {
+        const fromId = entityIds.get(normalizeEntityAlias(relation.from));
+        const toId = entityIds.get(normalizeEntityAlias(relation.to));
+        if (!fromId || !toId || fromId === toId) continue;
+        const validFrom = isoOr(relation.validFrom, occurredAt);
+        if (EXCLUSIVE_TEMPORAL_RELATIONS.has(relation.type)) {
+          const invalidated = db.prepare(`UPDATE edges SET valid_to = ?
+            WHERE from_entity_id = ? AND relation_type = ? AND to_entity_id <> ?
+              AND valid_to IS NULL AND valid_from <= ?`)
+            .run(validFrom, fromId, relation.type, toId, validFrom);
+          temporalInvalidations += Number(invalidated.changes ?? 0);
+        }
+        const edgeId = stableId("edge", `${episode.id}:${fromId}:${relation.type}:${toId}:${validFrom}`);
+        const inserted = db.prepare(`INSERT OR IGNORE INTO edges(
+          id, from_entity_id, relation_type, to_entity_id, valid_from, valid_to,
+          episode_id, confidence, created_at
+        ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)`)
+          .run(edgeId, fromId, relation.type, toId, validFrom, episode.id, clampConfidence(relation.confidence), now);
+        relationsCreated += Number(inserted.changes ?? 0);
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    return { episodeId: episode.id, idempotent: false, entitiesCreated, entityMerges, relationsCreated, temporalInvalidations };
+  }
+
+  private adjacentEdges(db: DatabaseSync, entityId: string, asOf: string, includeHistory: boolean): EdgeRow[] {
+    const temporalClause = includeHistory ? "" : "AND (e.valid_to IS NULL OR e.valid_to > ?)";
+    const statement = db.prepare(`SELECT e.*, source.canonical_name AS from_name, target.canonical_name AS to_name,
+        ep.source_path AS source_path
+      FROM edges e
+      JOIN entities source ON source.id = e.from_entity_id
+      JOIN entities target ON target.id = e.to_entity_id
+      JOIN episodes ep ON ep.id = e.episode_id
+      WHERE (e.from_entity_id = ? OR e.to_entity_id = ?)
+        AND e.valid_from <= ? ${temporalClause}
+      ORDER BY e.confidence DESC, e.valid_from DESC`);
+    return (includeHistory
+      ? statement.all(entityId, entityId, asOf)
+      : statement.all(entityId, entityId, asOf, asOf)) as unknown as EdgeRow[];
+  }
+
+  async retrieve(query: string, options: GraphRetrieveOptions): Promise<SearchResult> {
+    const startedAt = performance.now();
+    const db = await this.database();
+    const asOf = isoOr(options.asOf, new Date().toISOString());
+    const aliases = db.prepare(`SELECT a.alias, a.alias_norm, e.id, e.canonical_name, e.type
+      FROM entity_aliases a JOIN entities e ON e.id = a.entity_id`).all() as unknown as AliasRow[];
+    const seeds = aliases
+      .map((row) => ({ row, score: queryAliasScore(query, row.alias) }))
+      .filter(({ score }) => score >= 0.55)
+      .sort((a, b) => b.score - a.score || b.row.alias.length - a.row.alias.length)
+      .filter((item, index, all) => all.findIndex((candidate) => candidate.row.id === item.row.id) === index)
+      .slice(0, 6);
+
+    const hits: SearchHit[] = [];
+    const maxHops = Math.max(1, Math.min(4, Math.round(options.maxHops)));
+    for (const seed of seeds) {
+      let frontier: WalkState[] = [{
+        entityId: seed.row.id,
+        depth: 0,
+        seedScore: seed.score,
+        visitedEntities: new Set([seed.row.id]),
+        visitedEdges: new Set(),
+        labels: [seed.row.canonical_name],
+        episodeIds: [],
+        confidence: 1,
+      }];
+      for (let depth = 1; depth <= maxHops; depth += 1) {
+        const next: WalkState[] = [];
+        for (const state of frontier) {
+          for (const edge of this.adjacentEdges(db, state.entityId, asOf, options.includeHistory === true)) {
+            if (state.visitedEdges.has(edge.id)) continue;
+            const forward = edge.from_entity_id === state.entityId;
+            const targetId = forward ? edge.to_entity_id : edge.from_entity_id;
+            if (state.visitedEntities.has(targetId)) continue;
+            const sourceName = forward ? edge.from_name : edge.to_name;
+            const targetName = forward ? edge.to_name : edge.from_name;
+            const label = forward
+              ? `${sourceName} --${edge.relation_type}--> ${targetName}`
+              : `${sourceName} <--${edge.relation_type}-- ${targetName}`;
+            const confidence = state.confidence * clampConfidence(edge.confidence);
+            const temporalConfidence = edge.valid_to && edge.valid_to <= asOf ? 0.92 : 1;
+            const score = Math.max(0, Math.min(0.99, seed.score * confidence * temporalConfidence * (1 - (depth - 1) * 0.12)));
+            const labels = [...state.labels.slice(0, 1), ...state.labels.slice(1), label];
+            const episodeIds = [...state.episodeIds, edge.episode_id];
+            hits.push({
+              path: edge.source_path ?? `graph://episode/${edge.episode_id}`,
+              score,
+              snippet: `Graph path: ${labels.slice(1).join(" ; ")} (valid: ${edge.valid_from} -> ${edge.valid_to ?? "current"}; episode: ${episodeIds.join(" -> ")})`,
+              source: "graph",
+            });
+            next.push({
+              entityId: targetId,
+              depth,
+              seedScore: seed.score,
+              visitedEntities: new Set([...state.visitedEntities, targetId]),
+              visitedEdges: new Set([...state.visitedEdges, edge.id]),
+              labels,
+              episodeIds,
+              sourcePath: edge.source_path ?? state.sourcePath,
+              confidence,
+            });
+          }
+        }
+        frontier = next;
+        if (frontier.length === 0) break;
+      }
+    }
+
+    const deduped = hits
+      .sort((a, b) => b.score - a.score)
+      .filter((hit, index, all) => all.findIndex((candidate) => candidate.path === hit.path && candidate.snippet === hit.snippet) === index)
+      .slice(0, Math.max(1, options.maxResults));
+    const elapsed = Math.round(performance.now() - startedAt);
+    return { hits: deduped, timing: { spawnMs: 0, searchMs: elapsed, totalMs: elapsed }, rawOutput: "" };
+  }
+
+  async entityForAlias(alias: string): Promise<EntityRow | undefined> {
+    const db = await this.database();
+    return db.prepare(`SELECT e.id, e.canonical_name, e.type FROM entity_aliases a
+      JOIN entities e ON e.id = a.entity_id WHERE a.alias_norm = ?`)
+      .get(normalizeEntityAlias(alias)) as EntityRow | undefined;
+  }
+
+  async activeRelations(fromAlias: string, type: RelationType): Promise<Array<{ toName: string; validFrom: string; validTo: string | null }>> {
+    const db = await this.database();
+    const entity = await this.entityForAlias(fromAlias);
+    if (!entity) return [];
+    return db.prepare(`SELECT target.canonical_name AS toName, e.valid_from AS validFrom, e.valid_to AS validTo
+      FROM edges e JOIN entities target ON target.id = e.to_entity_id
+      WHERE e.from_entity_id = ? AND e.relation_type = ? ORDER BY e.valid_from`)
+      .all(entity.id, type) as unknown as Array<{ toName: string; validFrom: string; validTo: string | null }>;
+  }
+
+  close(): void {
+    this.db?.close();
+    this.db = undefined;
+  }
+}
+
+export function createGraphProvider(provider: string, file: string, workspaceDir?: string): GraphProvider {
+  if (provider !== "local-sqlite") {
+    throw new Error(`graph provider ${provider} is configured but not available in v1`);
+  }
+  return new SqliteGraphProvider(file, workspaceDir);
+}

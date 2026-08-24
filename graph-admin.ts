@@ -1,0 +1,792 @@
+import { createHash } from "node:crypto";
+import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { createGraphProvider, resolveGraphDatabasePath } from "./graph-provider.js";
+import { normalizeEntityAlias } from "./entity-resolution.js";
+import { isEntityType, isRelationType } from "./graph-types.js";
+import type { DatabaseSync } from "node:sqlite";
+import type { GraphEpisodeInput } from "./graph-types.js";
+
+const SNAPSHOT_FORMAT = "active-recall-graph-json";
+const SNAPSHOT_VERSION = 1;
+const TABLES = [
+  "episodes",
+  "entities",
+  "entity_aliases",
+  "edges",
+  "edge_provenance",
+  "entity_merge_events",
+  "temporal_invalidation_events",
+] as const;
+const INSERT_ORDER = [
+  "episodes",
+  "entities",
+  "entity_aliases",
+  "edges",
+  "edge_provenance",
+  "entity_merge_events",
+  "temporal_invalidation_events",
+] as const;
+const DELETE_ORDER = [...INSERT_ORDER].reverse();
+
+type KnownTable = (typeof TABLES)[number];
+type SqlRow = Record<string, unknown>;
+
+export interface GraphSnapshot {
+  format: typeof SNAPSHOT_FORMAT;
+  version: typeof SNAPSHOT_VERSION;
+  exportedAt: string;
+  sourceDatabase: string;
+  tables: Partial<Record<KnownTable, SqlRow[]>>;
+}
+
+export interface GraphMutationGuard {
+  /** Must resolve to exactly the database opened by this GraphAdmin instance. */
+  expectedDatabasePath: string;
+  /** Obtain this value from mutationToken() or a CLI dry run. */
+  confirmationToken: string;
+}
+
+export interface GraphMutationResult {
+  operation: string;
+  database: string;
+  backupFile: string;
+  episodesAffected: number;
+  edgesAffected: number;
+  entitiesAffected: number;
+  orphanPruneSkipped?: boolean;
+}
+
+export interface EntityInspection {
+  query: string;
+  matches: Array<{
+    id: string;
+    type: string;
+    canonicalName: string;
+    aliases: string[];
+    incomingEdges: SqlRow[];
+    outgoingEdges: SqlRow[];
+    sourceEpisodes: SqlRow[];
+  }>;
+}
+
+export interface AuditEvents {
+  available: boolean;
+  events: SqlRow[];
+}
+
+function quoteIdentifier(value: string): string {
+  if (!/^[a-z][a-z0-9_]*$/i.test(value)) throw new Error(`unsafe SQL identifier: ${value}`);
+  return `"${value}"`;
+}
+
+function normalizedPath(value: string): string {
+  const absolute = resolve(value);
+  return process.platform === "win32" ? absolute.toLocaleLowerCase("en-US") : absolute;
+}
+
+function iso(value: string, label: string): string {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) throw new Error(`${label} must be an ISO date/time`);
+  return new Date(parsed).toISOString();
+}
+
+function boundedLimit(value: number): number {
+  return Math.max(1, Math.min(500, Math.round(Number.isFinite(value) ? value : 20)));
+}
+
+function jsonSafe(value: unknown): unknown {
+  if (typeof value === "bigint") return value.toString();
+  if (Array.isArray(value)) return value.map(jsonSafe);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, jsonSafe(item)]));
+  }
+  return value;
+}
+
+function placeholders(count: number): string {
+  if (count < 1) throw new Error("at least one value is required");
+  return Array.from({ length: count }, () => "?").join(", ");
+}
+
+function snapshotTimestamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function record(value: unknown): SqlRow {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as SqlRow : {};
+}
+
+function validateEpisode(value: unknown): GraphEpisodeInput | null {
+  const item = record(value);
+  if (typeof item.id !== "string" || typeof item.sessionKey !== "string" || typeof item.summary !== "string") return null;
+  const occurredAt = typeof item.occurredAt === "string" ? item.occurredAt : "";
+  if (!Number.isFinite(Date.parse(occurredAt))) return null;
+  const entities = (Array.isArray(item.entities) ? item.entities : []).flatMap((raw) => {
+    const entity = record(raw);
+    if (typeof entity.name !== "string" || !isEntityType(entity.type)) return [];
+    return [{
+      name: entity.name,
+      type: entity.type,
+      aliases: Array.isArray(entity.aliases) ? entity.aliases.filter((alias): alias is string => typeof alias === "string") : [],
+    }];
+  });
+  const relations = (Array.isArray(item.relations) ? item.relations : []).flatMap((raw) => {
+    const relation = record(raw);
+    if (typeof relation.from !== "string" || typeof relation.to !== "string" || !isRelationType(relation.type)) return [];
+    return [{
+      from: relation.from,
+      type: relation.type,
+      to: relation.to,
+      confidence: typeof relation.confidence === "number" ? relation.confidence : undefined,
+      validFrom: typeof relation.validFrom === "string" ? relation.validFrom : undefined,
+    }];
+  });
+  return {
+    id: item.id,
+    sessionKey: item.sessionKey,
+    runId: typeof item.runId === "string" ? item.runId : undefined,
+    occurredAt,
+    source: typeof item.source === "string" ? item.source : "graph-admin-rebuild",
+    sourcePath: typeof item.sourcePath === "string" ? item.sourcePath : undefined,
+    summary: item.summary,
+    entities,
+    relations,
+  };
+}
+
+export function parseVectorEpisodeMarkdown(content: string, sourcePath?: string): GraphEpisodeInput | null {
+  const id = /^# Memory episode\s+(.+)$/m.exec(content)?.[1]?.trim();
+  const occurredAt = /^- Occurred:\s+(.+)$/m.exec(content)?.[1]?.trim();
+  const sessionKey = /^- Session:\s+(.+)$/m.exec(content)?.[1]?.trim();
+  const runValue = /^- Run:\s+(.+)$/m.exec(content)?.[1]?.trim();
+  const summary = /## Summary\s*\r?\n\r?\n([\s\S]*?)(?=\r?\n\r?\n## Entities)/m.exec(content)?.[1]?.trim();
+  if (!id || !occurredAt || !sessionKey || !summary || !Number.isFinite(Date.parse(occurredAt))) return null;
+
+  const entityBlock = /## Entities\s*\r?\n\r?\n([\s\S]*?)(?=\r?\n\r?\n## Relations)/m.exec(content)?.[1] ?? "";
+  const entities = entityBlock.split(/\r?\n/).flatMap((line) => {
+    const match = /^- (.+?) \(([A-Za-z_]+)\)(?:; aliases:\s*(.*))?$/.exec(line.trim());
+    if (!match || !isEntityType(match[2])) return [];
+    return [{
+      name: match[1].trim(),
+      type: match[2],
+      aliases: match[3] ? match[3].split(",").map((alias) => alias.trim()).filter(Boolean) : [],
+    }];
+  });
+  const relationBlock = /## Relations\s*\r?\n\r?\n([\s\S]*?)\s*$/m.exec(content)?.[1] ?? "";
+  const relations = relationBlock.split(/\r?\n/).flatMap((line) => {
+    const match = /^- (.+?) --([a-z_]+)--> (.+)$/.exec(line.trim());
+    if (!match || !isRelationType(match[2])) return [];
+    const rawTarget = match[3];
+    const metadataOffset = rawTarget.search(/;\s*(?:confidence|validFrom):/i);
+    const to = (metadataOffset >= 0 ? rawTarget.slice(0, metadataOffset) : rawTarget).trim();
+    const confidenceText = /;\s*confidence:\s*([0-9]*\.?[0-9]+)/i.exec(rawTarget)?.[1];
+    const validFrom = /;\s*validFrom:\s*([^;]+)\s*$/i.exec(rawTarget)?.[1]?.trim();
+    if (!to) return [];
+    return [{
+      from: match[1].trim(),
+      type: match[2],
+      to,
+      confidence: confidenceText === undefined ? undefined : Number(confidenceText),
+      validFrom,
+    }];
+  });
+  return {
+    id,
+    sessionKey,
+    runId: runValue && runValue !== "unknown" ? runValue : undefined,
+    occurredAt: new Date(Date.parse(occurredAt)).toISOString(),
+    source: "vector-episode-rebuild",
+    sourcePath,
+    summary,
+    entities,
+    relations,
+  };
+}
+
+export async function loadVectorEpisodes(directory: string, workspaceDir?: string): Promise<GraphEpisodeInput[]> {
+  const base = isAbsolute(directory) ? directory : resolve(workspaceDir ?? process.cwd(), directory);
+  const names = (await readdir(base, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.toLocaleLowerCase("en-US").endsWith(".md"))
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right, "en"));
+  const episodes: GraphEpisodeInput[] = [];
+  for (const name of names) {
+    const absolute = join(base, name);
+    const sourcePath = workspaceDir ? relative(workspaceDir, absolute).replace(/\\/g, "/") : absolute.replace(/\\/g, "/");
+    const parsed = parseVectorEpisodeMarkdown(await readFile(absolute, "utf8"), sourcePath);
+    if (parsed) episodes.push(parsed);
+  }
+  return episodes;
+}
+
+export class GraphAdmin {
+  readonly file: string;
+  readonly workspaceDir?: string;
+  private db?: DatabaseSync;
+
+  constructor(file: string, workspaceDir?: string) {
+    this.workspaceDir = workspaceDir;
+    this.file = resolveGraphDatabasePath(file, workspaceDir);
+  }
+
+  mutationToken(operation: string, target = "all"): string {
+    const digest = createHash("sha256")
+      .update(`${normalizedPath(this.file)}\n${operation}\n${target}`, "utf8")
+      .digest("hex")
+      .slice(0, 16);
+    return `GRAPH-${operation.toLocaleUpperCase("en-US").replace(/[^A-Z0-9]+/g, "-")}-${digest}`;
+  }
+
+  private assertGuard(operation: string, target: string, guard: GraphMutationGuard): void {
+    if (!guard || normalizedPath(guard.expectedDatabasePath) !== normalizedPath(this.file)) {
+      throw new Error(`refusing ${operation}: --expected-db must exactly match ${this.file}`);
+    }
+    const expected = this.mutationToken(operation, target);
+    if (guard.confirmationToken !== expected) {
+      throw new Error(`refusing ${operation}: confirmation token mismatch (dry-run token: ${expected})`);
+    }
+  }
+
+  private async exists(): Promise<boolean> {
+    try {
+      await access(this.file);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async initialize(): Promise<void> {
+    this.close();
+    const provider = createGraphProvider("local-sqlite", this.file, this.workspaceDir);
+    try {
+      await provider.retrieve("", { maxResults: 1, maxHops: 1 });
+    } finally {
+      provider.close?.();
+    }
+  }
+
+  private async database(create = false): Promise<DatabaseSync> {
+    if (this.db) return this.db;
+    if (create) await this.initialize();
+    if (!(await this.exists())) throw new Error(`graph database does not exist: ${this.file}`);
+    const sqlite = await import("node:sqlite");
+    const db = new sqlite.DatabaseSync(this.file);
+    db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=2000;");
+    this.db = db;
+    return db;
+  }
+
+  close(): void {
+    this.db?.close();
+    this.db = undefined;
+  }
+
+  private tableExists(db: DatabaseSync, table: string): boolean {
+    return Boolean((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { name?: string } | undefined)?.name);
+  }
+
+  private tableColumns(db: DatabaseSync, table: string): string[] {
+    if (!this.tableExists(db, table)) return [];
+    return (db.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all() as unknown as Array<{ name: string }>).map((item) => item.name);
+  }
+
+  async exportGraph(): Promise<GraphSnapshot> {
+    const db = await this.database();
+    const tables: GraphSnapshot["tables"] = {};
+    for (const table of TABLES) {
+      if (!this.tableExists(db, table)) continue;
+      tables[table] = jsonSafe(db.prepare(`SELECT * FROM ${quoteIdentifier(table)}`).all()) as SqlRow[];
+    }
+    return {
+      format: SNAPSHOT_FORMAT,
+      version: SNAPSHOT_VERSION,
+      exportedAt: new Date().toISOString(),
+      sourceDatabase: this.file,
+      tables,
+    };
+  }
+
+  async exportTo(file: string): Promise<GraphSnapshot> {
+    const snapshot = await this.exportGraph();
+    const target = resolve(file);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+    return snapshot;
+  }
+
+  private async backup(): Promise<{ file: string; snapshot: GraphSnapshot }> {
+    const snapshot = await this.exportGraph();
+    const file = `${this.file}.pre-${snapshotTimestamp()}.json`;
+    await writeFile(file, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+    return { file, snapshot };
+  }
+
+  private clearTables(db: DatabaseSync): { episodes: number; edges: number; entities: number } {
+    const counts = {
+      episodes: this.tableExists(db, "episodes") ? Number((db.prepare("SELECT COUNT(*) AS count FROM episodes").get() as { count: number | bigint }).count) : 0,
+      edges: this.tableExists(db, "edges") ? Number((db.prepare("SELECT COUNT(*) AS count FROM edges").get() as { count: number | bigint }).count) : 0,
+      entities: this.tableExists(db, "entities") ? Number((db.prepare("SELECT COUNT(*) AS count FROM entities").get() as { count: number | bigint }).count) : 0,
+    };
+    for (const table of DELETE_ORDER) {
+      if (this.tableExists(db, table)) db.exec(`DELETE FROM ${quoteIdentifier(table)}`);
+    }
+    return counts;
+  }
+
+  private insertSnapshot(db: DatabaseSync, snapshot: GraphSnapshot): void {
+    if (snapshot.format !== SNAPSHOT_FORMAT || snapshot.version !== SNAPSHOT_VERSION) {
+      throw new Error("unsupported graph snapshot format/version");
+    }
+    for (const table of INSERT_ORDER) {
+      if (!this.tableExists(db, table)) continue;
+      const available = new Set(this.tableColumns(db, table));
+      for (const raw of snapshot.tables[table] ?? []) {
+        const row = record(raw);
+        const columns = Object.keys(row).filter((column) => available.has(column));
+        if (columns.length === 0) continue;
+        const sql = `INSERT INTO ${quoteIdentifier(table)} (${columns.map(quoteIdentifier).join(", ")}) VALUES (${placeholders(columns.length)})`;
+        db.prepare(sql).run(...columns.map((column) => row[column] as never));
+      }
+    }
+  }
+
+  private async replaceSnapshot(snapshot: GraphSnapshot): Promise<void> {
+    await this.initialize();
+    const db = await this.database(true);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      this.clearTables(db);
+      this.insertSnapshot(db, snapshot);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async importGraph(snapshot: GraphSnapshot, guard: GraphMutationGuard): Promise<GraphMutationResult> {
+    const target = "snapshot";
+    this.assertGuard("import", target, guard);
+    await this.initialize();
+    const backup = await this.backup();
+    await this.replaceSnapshot(snapshot);
+    return {
+      operation: "import",
+      database: this.file,
+      backupFile: backup.file,
+      episodesAffected: snapshot.tables.episodes?.length ?? 0,
+      edgesAffected: snapshot.tables.edges?.length ?? 0,
+      entitiesAffected: snapshot.tables.entities?.length ?? 0,
+    };
+  }
+
+  private restoreTemporalInvalidations(db: DatabaseSync, episodeIds: string[]): void {
+    if (!this.tableExists(db, "temporal_invalidation_events") || episodeIds.length === 0) return;
+    const columns = this.tableColumns(db, "temporal_invalidation_events");
+    const episodeColumn = ["invalidated_by_episode_id", "episode_id", "source_episode_id"].find((name) => columns.includes(name));
+    if (!episodeColumn || !columns.includes("edge_id")) return;
+    const previousColumn = columns.includes("previous_valid_to") ? "previous_valid_to" : undefined;
+    const events = db.prepare(`SELECT * FROM temporal_invalidation_events WHERE ${quoteIdentifier(episodeColumn)} IN (${placeholders(episodeIds.length)})`)
+      .all(...episodeIds) as unknown as SqlRow[];
+    for (const event of events) {
+      if (typeof event.edge_id !== "string") continue;
+      db.prepare("UPDATE edges SET valid_to = ? WHERE id = ?").run(previousColumn ? event[previousColumn] ?? null : null, event.edge_id);
+    }
+    db.prepare(`DELETE FROM temporal_invalidation_events WHERE ${quoteIdentifier(episodeColumn)} IN (${placeholders(episodeIds.length)})`).run(...episodeIds);
+  }
+
+  private deleteAuditRows(db: DatabaseSync, table: KnownTable, episodeIds: string[]): void {
+    if (!this.tableExists(db, table)) return;
+    const columns = this.tableColumns(db, table);
+    for (const column of ["episode_id", "source_episode_id", "target_episode_id", "invalidated_by_episode_id"]) {
+      if (!columns.includes(column)) continue;
+      db.prepare(`DELETE FROM ${quoteIdentifier(table)} WHERE ${quoteIdentifier(column)} IN (${placeholders(episodeIds.length)})`).run(...episodeIds);
+    }
+  }
+
+  private rebuildTemporalGroups(db: DatabaseSync, groups: Array<{ fromEntityId: string; relationType: string }>): void {
+    const auditAvailable = this.tableExists(db, "temporal_invalidation_events");
+    const createdAt = new Date().toISOString();
+    for (const group of groups) {
+      const edges = db.prepare(`SELECT id, episode_id, valid_from
+        FROM edges WHERE from_entity_id = ? AND relation_type = ?
+        ORDER BY valid_from, created_at, id`)
+        .all(group.fromEntityId, group.relationType) as unknown as Array<{ id: string; episode_id: string; valid_from: string }>;
+      if (auditAvailable && edges.length > 0) {
+        db.prepare(`DELETE FROM temporal_invalidation_events WHERE edge_id IN (${placeholders(edges.length)})`)
+          .run(...edges.map((edge) => edge.id));
+      }
+      for (let index = 0; index < edges.length; index += 1) {
+        const edge = edges[index];
+        const next = edges[index + 1];
+        db.prepare("UPDATE edges SET valid_to = ? WHERE id = ?").run(next?.valid_from ?? null, edge.id);
+        if (auditAvailable && next) {
+          db.prepare(`INSERT INTO temporal_invalidation_events(
+              edge_id, invalidated_by_episode_id, previous_valid_to, new_valid_to, created_at
+            ) VALUES (?, ?, NULL, ?, ?)`)
+            .run(edge.id, next.episode_id, next.valid_from, createdAt);
+        }
+      }
+    }
+  }
+
+  private deleteEpisodes(db: DatabaseSync, episodeIds: string[]): { episodes: number; edges: number } {
+    if (episodeIds.length === 0) return { episodes: 0, edges: 0 };
+    const affectedGroups = db.prepare(`SELECT DISTINCT
+        from_entity_id AS fromEntityId, relation_type AS relationType
+      FROM edges WHERE episode_id IN (${placeholders(episodeIds.length)})`)
+      .all(...episodeIds) as unknown as Array<{ fromEntityId: string; relationType: string }>;
+    const temporalGroups = affectedGroups.filter((group) => {
+      if (group.relationType === "prefers") return true;
+      if (!this.tableExists(db, "temporal_invalidation_events")) return false;
+      return Boolean(db.prepare(`SELECT event.id
+        FROM temporal_invalidation_events event
+        JOIN edges edge ON edge.id = event.edge_id
+        WHERE edge.from_entity_id = ? AND edge.relation_type = ? LIMIT 1`)
+        .get(group.fromEntityId, group.relationType));
+    });
+    this.restoreTemporalInvalidations(db, episodeIds);
+    this.deleteAuditRows(db, "entity_merge_events", episodeIds);
+    this.deleteAuditRows(db, "temporal_invalidation_events", episodeIds);
+    const edgeIds = (db.prepare(`SELECT id FROM edges WHERE episode_id IN (${placeholders(episodeIds.length)})`).all(...episodeIds) as unknown as Array<{ id: string }>).map((row) => row.id);
+    if (this.tableExists(db, "temporal_invalidation_events") && edgeIds.length > 0) {
+      db.prepare(`DELETE FROM temporal_invalidation_events WHERE edge_id IN (${placeholders(edgeIds.length)})`).run(...edgeIds);
+    }
+    let deletedEdges = 0;
+    if (this.tableExists(db, "edge_provenance")) {
+      db.prepare(`DELETE FROM edge_provenance WHERE episode_id IN (${placeholders(episodeIds.length)})`).run(...episodeIds);
+      for (const edgeId of edgeIds) {
+        const replacement = db.prepare("SELECT episode_id FROM edge_provenance WHERE edge_id = ? ORDER BY episode_id LIMIT 1").get(edgeId) as { episode_id?: string } | undefined;
+        if (replacement?.episode_id) db.prepare("UPDATE edges SET episode_id = ? WHERE id = ?").run(replacement.episode_id, edgeId);
+        else deletedEdges += Number(db.prepare("DELETE FROM edges WHERE id = ?").run(edgeId).changes ?? 0);
+      }
+    } else {
+      deletedEdges += Number(db.prepare(`DELETE FROM edges WHERE episode_id IN (${placeholders(episodeIds.length)})`).run(...episodeIds).changes ?? 0);
+    }
+    this.rebuildTemporalGroups(db, temporalGroups);
+    const deletedEpisodes = Number(db.prepare(`DELETE FROM episodes WHERE id IN (${placeholders(episodeIds.length)})`).run(...episodeIds).changes ?? 0);
+    return { episodes: deletedEpisodes, edges: deletedEdges };
+  }
+
+  private pruneOrphansInTransaction(db: DatabaseSync): { entities: number; skipped: boolean } {
+    const episodeColumns = this.tableColumns(db, "episodes");
+    const episodeRows = db.prepare("SELECT * FROM episodes ORDER BY occurred_at, id").all() as unknown as SqlRow[];
+    if (episodeRows.length > 0 && !episodeColumns.includes("payload_json")) return { entities: 0, skipped: true };
+
+    const retainedInputs: GraphEpisodeInput[] = [];
+    for (const row of episodeRows) {
+      if (typeof row.payload_json !== "string") return { entities: 0, skipped: true };
+      try {
+        const parsed = validateEpisode(JSON.parse(row.payload_json));
+        if (!parsed) return { entities: 0, skipped: true };
+        retainedInputs.push(parsed);
+      } catch {
+        return { entities: 0, skipped: true };
+      }
+    }
+
+    const entities = db.prepare("SELECT id, type, canonical_name FROM entities").all() as unknown as Array<{ id: string; type: string; canonical_name: string }>;
+    const aliases = db.prepare("SELECT entity_id, alias_norm FROM entity_aliases").all() as unknown as Array<{ entity_id: string; alias_norm: string }>;
+    const entityById = new Map(entities.map((entity) => [entity.id, entity]));
+    const idsByTypedAlias = new Map<string, Set<string>>();
+    const addTypedAlias = (type: string, alias: string, entityId: string) => {
+      const key = `${type}:${normalizeEntityAlias(alias)}`;
+      const ids = idsByTypedAlias.get(key) ?? new Set<string>();
+      ids.add(entityId);
+      idsByTypedAlias.set(key, ids);
+    };
+    for (const entity of entities) addTypedAlias(entity.type, entity.canonical_name, entity.id);
+    for (const alias of aliases) {
+      const entity = entityById.get(alias.entity_id);
+      if (entity) addTypedAlias(entity.type, alias.alias_norm, entity.id);
+    }
+
+    const retainedIds = new Set<string>();
+    for (const episode of retainedInputs) {
+      for (const entity of episode.entities) {
+        for (const alias of [entity.name, ...(entity.aliases ?? [])]) {
+          for (const id of idsByTypedAlias.get(`${entity.type}:${normalizeEntityAlias(alias)}`) ?? []) retainedIds.add(id);
+        }
+      }
+    }
+    for (const row of db.prepare("SELECT from_entity_id, to_entity_id FROM edges").all() as unknown as Array<{ from_entity_id: string; to_entity_id: string }>) {
+      retainedIds.add(row.from_entity_id);
+      retainedIds.add(row.to_entity_id);
+    }
+
+    const orphanIds = entities.map((entity) => entity.id).filter((id) => !retainedIds.has(id));
+    for (const id of orphanIds) {
+      db.prepare("DELETE FROM entity_aliases WHERE entity_id = ?").run(id);
+      db.prepare("DELETE FROM entities WHERE id = ?").run(id);
+    }
+    return { entities: orphanIds.length, skipped: false };
+  }
+
+  private async deleteSelected(operation: string, target: string, episodeIds: string[], guard: GraphMutationGuard): Promise<GraphMutationResult> {
+    this.assertGuard(operation, target, guard);
+    const backup = await this.backup();
+    const db = await this.database();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const deleted = this.deleteEpisodes(db, episodeIds);
+      const pruned = this.pruneOrphansInTransaction(db);
+      db.exec("COMMIT");
+      return {
+        operation,
+        database: this.file,
+        backupFile: backup.file,
+        episodesAffected: deleted.episodes,
+        edgesAffected: deleted.edges,
+        entitiesAffected: pruned.entities,
+        orphanPruneSkipped: pruned.skipped,
+      };
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async deleteByEpisode(episodeId: string, guard: GraphMutationGuard): Promise<GraphMutationResult> {
+    const id = episodeId.trim();
+    if (!id) throw new Error("episode id is required");
+    const db = await this.database();
+    const exists = Boolean(db.prepare("SELECT id FROM episodes WHERE id = ?").get(id));
+    return this.deleteSelected("delete-episode", id, exists ? [id] : [], guard);
+  }
+
+  async deleteBySession(sessionKey: string, guard: GraphMutationGuard): Promise<GraphMutationResult> {
+    const session = sessionKey.trim();
+    if (!session) throw new Error("session key is required");
+    const db = await this.database();
+    const ids = (db.prepare("SELECT id FROM episodes WHERE session_key = ? ORDER BY occurred_at, id").all(session) as unknown as Array<{ id: string }>).map((row) => row.id);
+    return this.deleteSelected("delete-session", session, ids, guard);
+  }
+
+  async deleteByTimeRange(from: string, to: string, guard: GraphMutationGuard): Promise<GraphMutationResult> {
+    const start = iso(from, "from");
+    const end = iso(to, "to");
+    if (start > end) throw new Error("from must not be later than to");
+    const target = `${start}..${end}`;
+    const db = await this.database();
+    const ids = (db.prepare("SELECT id FROM episodes WHERE occurred_at >= ? AND occurred_at <= ? ORDER BY occurred_at, id").all(start, end) as unknown as Array<{ id: string }>).map((row) => row.id);
+    return this.deleteSelected("delete-time", target, ids, guard);
+  }
+
+  async clearGraph(guard: GraphMutationGuard): Promise<GraphMutationResult> {
+    const target = "all";
+    this.assertGuard("clear", target, guard);
+    const backup = await this.backup();
+    const db = await this.database();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const counts = this.clearTables(db);
+      db.exec("COMMIT");
+      return {
+        operation: "clear",
+        database: this.file,
+        backupFile: backup.file,
+        episodesAffected: counts.episodes,
+        edgesAffected: counts.edges,
+        entitiesAffected: counts.entities,
+      };
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async pruneOrphans(guard: GraphMutationGuard): Promise<GraphMutationResult> {
+    const target = "unreferenced";
+    this.assertGuard("prune-orphans", target, guard);
+    const backup = await this.backup();
+    const db = await this.database();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const pruned = this.pruneOrphansInTransaction(db);
+      db.exec("COMMIT");
+      return {
+        operation: "prune-orphans",
+        database: this.file,
+        backupFile: backup.file,
+        episodesAffected: 0,
+        edgesAffected: 0,
+        entitiesAffected: pruned.entities,
+        orphanPruneSkipped: pruned.skipped,
+      };
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private storedEpisodes(snapshot: GraphSnapshot): GraphEpisodeInput[] {
+    return (snapshot.tables.episodes ?? []).flatMap((row) => {
+      if (typeof row.payload_json !== "string") return [];
+      try {
+        const parsed = validateEpisode(JSON.parse(row.payload_json));
+        return parsed ? [parsed] : [];
+      } catch {
+        return [];
+      }
+    }).sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id));
+  }
+
+  private async rebuildEpisodes(episodes: GraphEpisodeInput[], operation: string, target: string, guard: GraphMutationGuard): Promise<GraphMutationResult> {
+    this.assertGuard(operation, target, guard);
+    const backup = await this.backup();
+    const before = backup.snapshot;
+    try {
+      const db = await this.database();
+      db.exec("BEGIN IMMEDIATE");
+      this.clearTables(db);
+      db.exec("COMMIT");
+      this.close();
+      const provider = createGraphProvider("local-sqlite", this.file, this.workspaceDir);
+      let edges = 0;
+      let entities = 0;
+      try {
+        for (const episode of episodes) {
+          const result = await provider.ingestEpisode(episode);
+          edges += result.relationsCreated;
+          entities += result.entitiesCreated;
+        }
+      } finally {
+        provider.close?.();
+      }
+      return {
+        operation,
+        database: this.file,
+        backupFile: backup.file,
+        episodesAffected: episodes.length,
+        edgesAffected: edges,
+        entitiesAffected: entities,
+      };
+    } catch (error) {
+      this.close();
+      try {
+        await this.replaceSnapshot(before);
+      } catch (restoreError) {
+        throw new AggregateError([error, restoreError], `${operation} failed and automatic restore also failed; use ${backup.file}`);
+      }
+      throw error;
+    }
+  }
+
+  async rebuildFromStoredEpisodes(guard: GraphMutationGuard): Promise<GraphMutationResult> {
+    const snapshot = await this.exportGraph();
+    const episodes = this.storedEpisodes(snapshot);
+    const storedCount = snapshot.tables.episodes?.length ?? 0;
+    if (episodes.length !== storedCount) {
+      throw new Error(`cannot rebuild: ${storedCount - episodes.length} episode(s) have no valid payload_json`);
+    }
+    return this.rebuildEpisodes(episodes, "rebuild-stored", "stored-episodes", guard);
+  }
+
+  async rebuildFromVectorDirectory(directory: string, guard: GraphMutationGuard): Promise<GraphMutationResult> {
+    const absolute = isAbsolute(directory) ? directory : resolve(this.workspaceDir ?? process.cwd(), directory);
+    const episodes = await loadVectorEpisodes(absolute, this.workspaceDir);
+    if (episodes.length === 0) throw new Error(`no valid vector episode Markdown files found in ${absolute}`);
+    return this.rebuildEpisodes(episodes, "rebuild-vector", normalizedPath(absolute), guard);
+  }
+
+  private edgeRows(db: DatabaseSync, entityId: string, direction: "incoming" | "outgoing"): SqlRow[] {
+    const sourceColumn = direction === "outgoing" ? "from_entity_id" : "to_entity_id";
+    const otherColumn = direction === "outgoing" ? "to_entity_id" : "from_entity_id";
+    const nameLabel = direction === "outgoing" ? "to_name" : "from_name";
+    const rows = db.prepare(`SELECT edge.*, other.canonical_name AS ${nameLabel}, other.type AS other_type,
+        episode.session_key AS source_session_key, episode.occurred_at AS source_occurred_at,
+        episode.source_path AS source_path
+      FROM edges edge
+      JOIN entities other ON other.id = edge.${otherColumn}
+      JOIN episodes episode ON episode.id = edge.episode_id
+      WHERE edge.${sourceColumn} = ?
+      ORDER BY edge.valid_from DESC, edge.id`).all(entityId) as unknown as SqlRow[];
+    if (!this.tableExists(db, "edge_provenance")) return rows;
+    return rows.map((row) => ({
+      ...row,
+      source_episode_ids: (db.prepare("SELECT episode_id FROM edge_provenance WHERE edge_id = ? ORDER BY episode_id").all(row.id as string) as unknown as Array<{ episode_id: string }>).map((item) => item.episode_id),
+    }));
+  }
+
+  async inspectEntity(query: string): Promise<EntityInspection> {
+    const db = await this.database();
+    const normalized = normalizeEntityAlias(query);
+    const aliasColumns = this.tableColumns(db, "entity_aliases");
+    const aliasJoin = aliasColumns.includes("alias_norm")
+      ? "LEFT JOIN entity_aliases alias ON alias.entity_id = entity.id"
+      : "LEFT JOIN entity_aliases alias ON 1 = 0";
+    const rows = db.prepare(`SELECT DISTINCT entity.id, entity.type, entity.canonical_name
+      FROM entities entity ${aliasJoin}
+      WHERE entity.id = ? OR lower(entity.canonical_name) = lower(?) OR alias.alias_norm = ?
+      ORDER BY entity.type, entity.canonical_name, entity.id`).all(query, query, normalized) as unknown as Array<{ id: string; type: string; canonical_name: string }>;
+    const episodeRows = this.tableExists(db, "episodes")
+      ? db.prepare("SELECT * FROM episodes ORDER BY occurred_at, id").all() as unknown as SqlRow[]
+      : [];
+    return {
+      query,
+      matches: rows.map((entity) => {
+        const aliases = (db.prepare("SELECT alias FROM entity_aliases WHERE entity_id = ? ORDER BY alias_norm, alias").all(entity.id) as unknown as Array<{ alias: string }>).map((item) => item.alias);
+        const edgeEpisodeIds = new Set<string>();
+        const incomingEdges = this.edgeRows(db, entity.id, "incoming");
+        const outgoingEdges = this.edgeRows(db, entity.id, "outgoing");
+        for (const edge of [...incomingEdges, ...outgoingEdges]) {
+          if (typeof edge.episode_id === "string") edgeEpisodeIds.add(edge.episode_id);
+          for (const id of Array.isArray(edge.source_episode_ids) ? edge.source_episode_ids : []) {
+            if (typeof id === "string") edgeEpisodeIds.add(id);
+          }
+        }
+        const entityNames = new Set([entity.canonical_name, ...aliases].map(normalizeEntityAlias));
+        for (const episode of episodeRows) {
+          if (typeof episode.payload_json !== "string") continue;
+          try {
+            const payload = validateEpisode(JSON.parse(episode.payload_json));
+            if (payload?.entities.some((item) => [item.name, ...(item.aliases ?? [])].some((name) => entityNames.has(normalizeEntityAlias(name))))) {
+              if (typeof episode.id === "string") edgeEpisodeIds.add(episode.id);
+            }
+          } catch {
+            // Invalid historical payloads remain visible in exports; inspection skips only this enrichment.
+          }
+        }
+        return {
+          id: entity.id,
+          type: entity.type,
+          canonicalName: entity.canonical_name,
+          aliases,
+          incomingEdges,
+          outgoingEdges,
+          sourceEpisodes: episodeRows.filter((episode) => typeof episode.id === "string" && edgeEpisodeIds.has(episode.id)),
+        };
+      }),
+    };
+  }
+
+  private async recentEvents(table: "entity_merge_events" | "temporal_invalidation_events", limit: number): Promise<AuditEvents> {
+    const db = await this.database();
+    if (!this.tableExists(db, table)) return { available: false, events: [] };
+    const columns = this.tableColumns(db, table);
+    const timestamp = ["created_at", "merged_at", "invalidated_at"].find((column) => columns.includes(column));
+    const order = timestamp ? `${quoteIdentifier(timestamp)} DESC` : "rowid DESC";
+    return {
+      available: true,
+      events: jsonSafe(db.prepare(`SELECT * FROM ${quoteIdentifier(table)} ORDER BY ${order} LIMIT ?`).all(boundedLimit(limit))) as SqlRow[],
+    };
+  }
+
+  recentEntityMerges(limit = 20): Promise<AuditEvents> {
+    return this.recentEvents("entity_merge_events", limit);
+  }
+
+  recentTemporalInvalidations(limit = 20): Promise<AuditEvents> {
+    return this.recentEvents("temporal_invalidation_events", limit);
+  }
+}
+
+export async function readGraphSnapshot(file: string): Promise<GraphSnapshot> {
+  const value = JSON.parse(await readFile(resolve(file), "utf8")) as GraphSnapshot;
+  if (value.format !== SNAPSHOT_FORMAT || value.version !== SNAPSHOT_VERSION || !value.tables || typeof value.tables !== "object") {
+    throw new Error("invalid graph snapshot");
+  }
+  return value;
+}

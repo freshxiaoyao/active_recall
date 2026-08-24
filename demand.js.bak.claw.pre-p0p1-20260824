@@ -1,0 +1,124 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const memoryIntentPatterns = [
+  /(?:你|还|是否|能不能|可以).{0,6}记得/,
+  /(?:从|查|翻).{0,8}(?:记忆|历史记录)/,
+  /回忆(?:一下|下)?(?:我们|之前|上次|过去)?/,
+  /\b(?:do you|can you|you)\s+(?:still\s+)?remember\b/i,
+  /\brecall\s+(?:what|when|how|our|the)\b/i,
+  /\b(?:from|search)\s+(?:your\s+)?memor(?:y|ies)\b/i,
+];
+
+// A bare temporal word is deliberately insufficient: “以前的人如何保存食物” is a generic question.
+const historicalReferencePatterns = [
+  /(?:之前|上次|上回|以前|先前|当时|昨天|前几天|曾经).{0,20}(?:我们|咱们|你|我).{0,12}(?:说过|聊过|提过|做过|改过|定过|决定过|约定过|讨论过|说的|聊的|提的|做的|改的|定的|决定的|约定的|讨论的|说了|聊了|提了|做了|改了|定了|决定了|约定了|讨论了)/,
+  /(?:我们|咱们|你|我).{0,12}(?:之前|上次|上回|以前|先前|当时|昨天|前几天|曾经).{0,12}(?:说过|聊过|提过|做过|改过|定过|决定过|约定过|讨论过|说的|聊的|提的|做的|改的|定的|决定的|约定的|讨论的|说了|聊了|提了|做了|改了|定了|决定了|约定了|讨论了)/,
+  /(?:之前|上次|上回|先前|当时)(?:的)?(?:决定|约定|结论|方案|配置|偏好|进度|版本)/,
+  /(?:我们|咱们|你|我).{0,12}(?:说过|聊过|提过|做过|改过|定过|决定过|约定过|讨论过|说的|聊的|提的|做的|改的|定的|决定的|约定的|讨论的).{0,24}(?:之前|上次|上回|以前|先前|当时|曾经)/,
+  /(?:继续|接着)(?:上次|之前|先前|昨天)/,
+  /按(?:我|我们)?(?:之前|一贯|平时|原来)(?:的)?(?:偏好|习惯|风格|约定|方案|配置)/,
+  /\b(?:last time|previously|in (?:an|our) earlier session)\b.{0,80}\b(?:(?:we|i)\b.{0,40}\b(?:agreed|decided|discussed|worked|changed|configured)|you\b.{0,40}\b(?:said|told|recommended|changed|configured))\b/i,
+  /\b(?:(?:we|i)\b.{0,80}\b(?:agree|agreed|decide|decided|discuss|discussed|work|worked|change|changed|configure|configured)|you\b.{0,80}\b(?:say|said|tell|told|recommend|recommended|change|changed|configure|configured))\b.{0,40}\b(?:before|previously|last time)\b/i,
+  /\b(?:my|our)\s+(?:usual|saved|previous)\s+(?:preferences?|style|settings?)\b/i,
+];
+
+const ambiguousReferencePatterns = [
+  /(?:那个|那件事|之前那个|上次那个)(?:项目|插件|问题|方案|配置|任务|东西|事)?[^。！？\n]{0,36}(?:现在|目前|进展|状态|做到哪|哪一步|怎么样|后来)/,
+  /\b(?:that|the previous)\s+(?:project|plugin|issue|plan|task|setup)\b.{0,80}\b(?:now|status|progress|where|current|later)\b/i,
+];
+
+const uncertainContextPatterns = [
+  /(?:这个|当前|现有|目前|继续|接着|还是|再|重新).{0,24}(?:项目|插件|配置|方案|代码|实现|流程|任务|调优)/,
+  /(?:帮我|就按|照着|按照)(?:这个|上面|刚才|该)?[^。！？\n]{0,20}(?:落地|继续|修改|调整|优化|完善|实现)/,
+  /(?:我的|我们的|适合我|按我的|当前配置|现有配置|已有方案)/,
+  /\b(?:my|our|this|the current)\s+(?:project|plugin|setup|configuration|config|workflow|implementation|codebase)\b/i,
+  /\b(?:continue|keep going|implement|apply|tune|optimi[sz]e)\s+(?:this|that|it|the current)\b/i,
+];
+
+function matchPrefix(input        , prefixes          )                                                       {
+  const lower = input.toLocaleLowerCase();
+  for (const prefix of prefixes) {
+    const normalizedPrefix = prefix.trim();
+    if (!normalizedPrefix || !lower.startsWith(normalizedPrefix.toLocaleLowerCase())) continue;
+    const remainder = input.slice(normalizedPrefix.length);
+    if (normalizedPrefix.startsWith("/") && remainder && !/^[\s:：-]/.test(remainder)) continue;
+    return { matched: true, query: remainder.replace(/^[\s:：-]+/, "").trim(), prefix: normalizedPrefix };
+  }
+  return { matched: false, query: input };
+}
+
+function includesKeyword(input        , keywords          )          {
+  const lower = input.toLocaleLowerCase();
+  return keywords.some((keyword) => keyword && lower.includes(keyword.toLocaleLowerCase()));
+}
+
+function explicitDepth(query        )                                         {
+  const match = query.match(/^(literal|balanced|deep)\b[\s:：-]*/i);
+  if (!match) return { query };
+  return {
+    depth: match[1].toLocaleLowerCase()               ,
+    query: query.slice(match[0].length).trim(),
+  };
+}
+
+/** High-precision, zero-LLM first-stage gate. Only uncertain results may use the semantic gate. */
+export function evaluateRecallDemand(input        , config                     )               {
+  const query = input.trim();
+  if (!query) return { decision: "no", query, reason: "not_needed", confidence: 1 };
+
+  const suppressed = matchPrefix(query, config.suppressPrefixes);
+  if (suppressed.matched) return { decision: "no", query: suppressed.query, reason: "suppressed", confidence: 1, depth: "none" };
+
+  const explicit = matchPrefix(query, config.explicitPrefixes);
+  if (explicit.matched) {
+    const parsed = explicitDepth(explicit.query);
+    return parsed.query.length > 0
+      ? { decision: "yes", query: parsed.query, reason: "explicit_prefix", confidence: 1, depth: parsed.depth }
+      : { decision: "no", query: parsed.query, reason: "not_needed", confidence: 1, depth: "none" };
+  }
+
+  if (config.mode === "always") return { decision: "yes", query, reason: "always", confidence: 1 };
+  if (includesKeyword(query, config.additionalKeywords)) {
+    return { decision: "yes", query, reason: "custom_keyword", confidence: 1 };
+  }
+  if (config.mode === "explicit") return { decision: "no", query, reason: "not_needed", confidence: 1, depth: "none" };
+  if (memoryIntentPatterns.some((pattern) => pattern.test(query))) {
+    return { decision: "yes", query, reason: "memory_intent", confidence: 0.98 };
+  }
+  if (historicalReferencePatterns.some((pattern) => pattern.test(query))) {
+    return { decision: "yes", query, reason: "historical_reference", confidence: 0.95 };
+  }
+  if (ambiguousReferencePatterns.some((pattern) => pattern.test(query))) {
+    return { decision: "yes", query, reason: "ambiguous_reference", confidence: 0.92 };
+  }
+  if (uncertainContextPatterns.some((pattern) => pattern.test(query))) {
+    return { decision: "uncertain", query, reason: "user_specific_context" };
+  }
+  return { decision: "no", query, reason: "not_needed", confidence: 0.9, depth: "none" };
+}
+
+
+//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active_recall\demand.ts

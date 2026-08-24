@@ -1,0 +1,2718 @@
+{
+  "schemaVersion": 1,
+  "corpus": "recorded-corpus/writer-quality-corpus.jsonl",
+  "database": "os-temp/writer-replay.sqlite",
+  "deterministic": true,
+  "repeatRuns": 2,
+  "generatedAt": "2026-08-23T09:00:00.000Z",
+  "pipeline": {
+    "input": "historical-conversation-jsonl",
+    "extraction": "recorded-deterministic",
+    "graphReadExecuted": false,
+    "promptInjectionExecuted": false
+  },
+  "stats": {
+    "samples": 30,
+    "episodes": 27,
+    "entities": 66,
+    "uniqueEntities": 28,
+    "aliases": 39,
+    "edges": 30,
+    "duplicateEdges": 0,
+    "deduplicatedEdges": 7,
+    "merges": 1,
+    "suspiciousMerges": 0,
+    "temporalInvalidations": 2,
+    "orphanEntities": 1,
+    "writeLatencyMs": {
+      "p50": 2.01,
+      "p95": 3.04
+    },
+    "failures": 0,
+    "idempotencyFailures": 0
+  },
+  "topEntityTypes": [
+    {
+      "type": "Software",
+      "count": 7
+    },
+    {
+      "type": "Tool",
+      "count": 5
+    },
+    {
+      "type": "Model",
+      "count": 4
+    },
+    {
+      "type": "Project",
+      "count": 4
+    },
+    {
+      "type": "Goal",
+      "count": 3
+    },
+    {
+      "type": "Platform",
+      "count": 2
+    },
+    {
+      "type": "Device",
+      "count": 1
+    },
+    {
+      "type": "Preference",
+      "count": 1
+    },
+    {
+      "type": "User",
+      "count": 1
+    }
+  ],
+  "topEdgeTypes": [
+    {
+      "type": "related_to",
+      "count": 5
+    },
+    {
+      "type": "runs_on",
+      "count": 4
+    },
+    {
+      "type": "uses",
+      "count": 4
+    },
+    {
+      "type": "prefers",
+      "count": 3
+    },
+    {
+      "type": "published_on",
+      "count": 3
+    },
+    {
+      "type": "targets",
+      "count": 3
+    },
+    {
+      "type": "depends_on",
+      "count": 2
+    },
+    {
+      "type": "develops",
+      "count": 2
+    },
+    {
+      "type": "maintained_with",
+      "count": 2
+    },
+    {
+      "type": "owns",
+      "count": 1
+    },
+    {
+      "type": "works_on",
+      "count": 1
+    }
+  ],
+  "highFrequencyAliasMerges": [
+    {
+      "entityId": "ent_a92d6f674c0747d4832f270e",
+      "canonicalName": "openclaw-human-gate",
+      "type": "Project",
+      "aliasCount": 5,
+      "aliases": [
+        "hg",
+        "human-gate",
+        "openclaw-human-gate",
+        "我的审批插件",
+        "那个插件"
+      ]
+    },
+    {
+      "entityId": "ent_76ebe80d86c62126cab7ce10",
+      "canonicalName": "本地低延迟可回滚",
+      "type": "Preference",
+      "aliasCount": 2,
+      "aliases": [
+        "本地低延迟可回滚",
+        "本地可部署"
+      ]
+    },
+    {
+      "entityId": "ent_0786b3f79a81315283fc7e8d",
+      "canonicalName": "active-recall",
+      "type": "Project",
+      "aliasCount": 2,
+      "aliases": [
+        "active-recall",
+        "之前那个项目"
+      ]
+    },
+    {
+      "entityId": "ent_db552c82204565bd31dbcc43",
+      "canonicalName": "before_prompt_build",
+      "type": "Tool",
+      "aliasCount": 2,
+      "aliases": [
+        "before_prompt_build",
+        "before_prompt_build hook"
+      ]
+    },
+    {
+      "entityId": "ent_bd1167978ece36e9de04f6bf",
+      "canonicalName": "C:\\Users\\user\\.openclaw\\workspace\\plugins\\active_recall",
+      "type": "Platform",
+      "aliasCount": 2,
+      "aliases": [
+        "C:\\Users\\user\\.openclaw\\workspace\\plugins\\active_recall",
+        "workspace/plugins/active_recall"
+      ]
+    },
+    {
+      "entityId": "ent_7c71c3b85e3e470787ac85d8",
+      "canonicalName": "local-sqlite",
+      "type": "Software",
+      "aliasCount": 2,
+      "aliases": [
+        "SQLite",
+        "local-sqlite"
+      ]
+    },
+    {
+      "entityId": "ent_e9783f50d0118666112af8cc",
+      "canonicalName": "TypeScript",
+      "type": "Software",
+      "aliasCount": 2,
+      "aliases": [
+        "TS",
+        "TypeScript"
+      ]
+    },
+    {
+      "entityId": "ent_cc91aecb3c78702fc0a6b47a",
+      "canonicalName": "Windows 11",
+      "type": "Software",
+      "aliasCount": 2,
+      "aliases": [
+        "Windows",
+        "Windows 11"
+      ]
+    }
+  ],
+  "suspiciousMergeDetails": [],
+  "graphExplosionEpisodes": [],
+  "failures": [],
+  "samples": [
+    {
+      "id": "quality-01-human-gate-primary",
+      "input": "我在开发 openclaw-human-gate，也叫 human-gate 或 Human Gate。",
+      "expectedEntities": [
+        {
+          "name": "小夭",
+          "type": "User"
+        },
+        {
+          "name": "openclaw-human-gate",
+          "type": "Project"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "openclaw-human-gate",
+          "type": "Project",
+          "aliases": [
+            "openclaw-human-gate",
+            "human-gate",
+            "Human Gate"
+          ],
+          "identityGroup": "human_gate_project"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "小夭",
+          "type": "develops",
+          "to": "openclaw-human-gate"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-01-human-gate-primary",
+        "entities": [
+          {
+            "name": "小夭",
+            "type": "User",
+            "aliases": []
+          },
+          {
+            "name": "openclaw-human-gate",
+            "type": "Project",
+            "aliases": [
+              "human-gate",
+              "Human Gate"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "from": "小夭",
+            "type": "develops",
+            "to": "openclaw-human-gate",
+            "confidence": 0.98
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 2,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "human_gate_project",
+            "entityIds": [
+              "ent_a92d6f674c0747d4832f270e"
+            ],
+            "expectedType": "Project",
+            "actualAliases": [
+              "hg",
+              "human-gate",
+              "openclaw-human-gate",
+              "我的审批插件",
+              "那个插件"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-02-human-gate-colloquial",
+      "input": "我的审批插件平时简称 hg，它跑在 OpenClaw 里。",
+      "expectedEntities": [
+        {
+          "name": "我的审批插件",
+          "type": "Project"
+        },
+        {
+          "name": "OpenClaw",
+          "type": "Software"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "我的审批插件",
+          "type": "Project",
+          "aliases": [
+            "我的审批插件",
+            "hg"
+          ],
+          "identityGroup": "human_gate_project"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "我的审批插件",
+          "type": "related_to",
+          "to": "OpenClaw"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-02-human-gate-colloquial",
+        "entities": [
+          {
+            "name": "我的审批插件",
+            "type": "Project",
+            "aliases": [
+              "hg"
+            ]
+          },
+          {
+            "name": "OpenClaw",
+            "type": "Software",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "我的审批插件",
+            "type": "related_to",
+            "to": "OpenClaw",
+            "confidence": 0.94
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 2,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "human_gate_project",
+            "entityIds": [
+              "ent_a92d6f674c0747d4832f270e"
+            ],
+            "expectedType": "Project",
+            "actualAliases": [
+              "hg",
+              "human-gate",
+              "openclaw-human-gate",
+              "我的审批插件",
+              "那个插件"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-03-human-gate-bridge",
+      "input": "确认一下：human-gate、hg、openclaw-human-gate 和我的审批插件都是同一个项目。",
+      "expectedEntities": [
+        {
+          "name": "human-gate",
+          "type": "Project"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "human-gate",
+          "type": "Project",
+          "aliases": [
+            "human-gate",
+            "Human Gate",
+            "openclaw-human-gate",
+            "hg",
+            "我的审批插件"
+          ],
+          "identityGroup": "human_gate_project"
+        }
+      ],
+      "expectedEdges": [],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-03-human-gate-bridge",
+        "entities": [
+          {
+            "name": "human-gate",
+            "type": "Project",
+            "aliases": [
+              "Human Gate",
+              "openclaw-human-gate",
+              "hg",
+              "我的审批插件"
+            ]
+          }
+        ],
+        "edges": [],
+        "idempotent": false,
+        "entitiesCreated": 0,
+        "entityMerges": 1,
+        "edgesCreated": 0,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "human_gate_project",
+            "entityIds": [
+              "ent_a92d6f674c0747d4832f270e"
+            ],
+            "expectedType": "Project",
+            "actualAliases": [
+              "hg",
+              "human-gate",
+              "openclaw-human-gate",
+              "我的审批插件",
+              "那个插件"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-04-project-tool",
+      "input": "human-gate 现在用 Codex 维护。",
+      "expectedEntities": [
+        {
+          "name": "human-gate",
+          "type": "Project"
+        },
+        {
+          "name": "Codex",
+          "type": "Tool"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "human-gate",
+          "type": "Project",
+          "aliases": [
+            "human-gate",
+            "hg"
+          ],
+          "identityGroup": "human_gate_project"
+        },
+        {
+          "entity": "Codex",
+          "type": "Tool",
+          "aliases": [
+            "Codex"
+          ],
+          "identityGroup": "codex_tool"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "human-gate",
+          "type": "maintained_with",
+          "to": "Codex"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-04-project-tool",
+        "entities": [
+          {
+            "name": "human-gate",
+            "type": "Project",
+            "aliases": [
+              "hg"
+            ]
+          },
+          {
+            "name": "Codex",
+            "type": "Tool",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "human-gate",
+            "type": "maintained_with",
+            "to": "Codex",
+            "confidence": 0.97
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "human_gate_project",
+            "entityIds": [
+              "ent_a92d6f674c0747d4832f270e"
+            ],
+            "expectedType": "Project",
+            "actualAliases": [
+              "hg",
+              "human-gate",
+              "openclaw-human-gate",
+              "我的审批插件",
+              "那个插件"
+            ]
+          },
+          {
+            "identityGroup": "codex_tool",
+            "entityIds": [
+              "ent_919551a29c3866a82d9e51e0"
+            ],
+            "expectedType": "Tool",
+            "actualAliases": [
+              "Codex"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-05-duplicate-fact",
+      "input": "再说一次，Human Gate 是用 Codex 维护的。",
+      "expectedEntities": [
+        {
+          "name": "Human Gate",
+          "type": "Project"
+        },
+        {
+          "name": "Codex",
+          "type": "Tool"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "Human Gate",
+          "type": "Project",
+          "aliases": [
+            "Human Gate",
+            "human-gate"
+          ],
+          "identityGroup": "human_gate_project"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "Human Gate",
+          "type": "maintained_with",
+          "to": "Codex"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-05-duplicate-fact",
+        "entities": [
+          {
+            "name": "Human Gate",
+            "type": "Project",
+            "aliases": [
+              "human-gate"
+            ]
+          },
+          {
+            "name": "Codex",
+            "type": "Tool",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "Human Gate",
+            "type": "maintained_with",
+            "to": "Codex",
+            "confidence": 0.96
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 0,
+        "entityMerges": 0,
+        "edgesCreated": 0,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "human_gate_project",
+            "entityIds": [
+              "ent_a92d6f674c0747d4832f270e"
+            ],
+            "expectedType": "Project",
+            "actualAliases": [
+              "hg",
+              "human-gate",
+              "openclaw-human-gate",
+              "我的审批插件",
+              "那个插件"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-06-project-model",
+      "input": "active-recall 的向量检索模型是 BGE-M3。",
+      "expectedEntities": [
+        {
+          "name": "active-recall",
+          "type": "Project"
+        },
+        {
+          "name": "BGE-M3",
+          "type": "Model"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "BGE-M3",
+          "type": "Model",
+          "aliases": [
+            "BGE-M3",
+            "bge-m3"
+          ],
+          "identityGroup": "bge_m3_model"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "active-recall",
+          "type": "uses",
+          "to": "BGE-M3"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-06-project-model",
+        "entities": [
+          {
+            "name": "active-recall",
+            "type": "Project",
+            "aliases": []
+          },
+          {
+            "name": "BGE-M3",
+            "type": "Model",
+            "aliases": [
+              "bge-m3"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "from": "active-recall",
+            "type": "uses",
+            "to": "BGE-M3",
+            "confidence": 0.99
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 2,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "bge_m3_model",
+            "entityIds": [
+              "ent_92cffa334efd88507958b541"
+            ],
+            "expectedType": "Model",
+            "actualAliases": [
+              "BGE-M3"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-07-project-model-deepseek",
+      "input": "Graph writer 的抽取模型暂时是 deepseek-flash。",
+      "expectedEntities": [
+        {
+          "name": "Graph Memory writer",
+          "type": "Project"
+        },
+        {
+          "name": "deepseek-flash",
+          "type": "Model"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "deepseek-flash",
+          "type": "Model",
+          "aliases": [
+            "deepseek-flash",
+            "DeepSeek Flash"
+          ],
+          "identityGroup": "deepseek_flash_model"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "Graph Memory writer",
+          "type": "uses",
+          "to": "deepseek-flash"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-07-project-model-deepseek",
+        "entities": [
+          {
+            "name": "Graph Memory writer",
+            "type": "Project",
+            "aliases": []
+          },
+          {
+            "name": "deepseek-flash",
+            "type": "Model",
+            "aliases": [
+              "DeepSeek Flash"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "from": "Graph Memory writer",
+            "type": "uses",
+            "to": "deepseek-flash",
+            "confidence": 0.93
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 2,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "deepseek_flash_model",
+            "entityIds": [
+              "ent_80a47bc68d9751c58bf7b17c"
+            ],
+            "expectedType": "Model",
+            "actualAliases": [
+              "deepseek-flash"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-08-preference-old",
+      "input": "我以前更喜欢 DeepSeek。",
+      "expectedEntities": [
+        {
+          "name": "小夭",
+          "type": "User"
+        },
+        {
+          "name": "DeepSeek",
+          "type": "Model"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "小夭",
+          "type": "User",
+          "aliases": [
+            "小夭"
+          ],
+          "identityGroup": "user_xiaoyao"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "小夭",
+          "type": "prefers",
+          "to": "DeepSeek"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0,
+        "note": "Creates the historical preference."
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-08-preference-old",
+        "entities": [
+          {
+            "name": "小夭",
+            "type": "User",
+            "aliases": []
+          },
+          {
+            "name": "DeepSeek",
+            "type": "Model",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "小夭",
+            "type": "prefers",
+            "to": "DeepSeek",
+            "confidence": 0.93,
+            "validFrom": "2026-08-01T08:00:00.000Z"
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "user_xiaoyao",
+            "entityIds": [
+              "ent_437dfe042d8ad5a30831b494"
+            ],
+            "expectedType": "User",
+            "actualAliases": [
+              "小夭"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-09-preference-current",
+      "input": "后来我换成更喜欢 GPT-5.6，现在主要用它。",
+      "expectedEntities": [
+        {
+          "name": "小夭",
+          "type": "User"
+        },
+        {
+          "name": "GPT-5.6",
+          "type": "Model"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "GPT-5.6",
+          "type": "Model",
+          "aliases": [
+            "GPT-5.6",
+            "GPT 5.6"
+          ],
+          "identityGroup": "gpt56_model"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "小夭",
+          "type": "prefers",
+          "to": "GPT-5.6"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 1,
+        "note": "Closes DeepSeek at 2026-08-20 and preserves its historical edge."
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-09-preference-current",
+        "entities": [
+          {
+            "name": "小夭",
+            "type": "User",
+            "aliases": []
+          },
+          {
+            "name": "GPT-5.6",
+            "type": "Model",
+            "aliases": [
+              "GPT 5.6"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "from": "小夭",
+            "type": "prefers",
+            "to": "GPT-5.6",
+            "confidence": 0.98,
+            "validFrom": "2026-08-20T08:00:00.000Z"
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 1,
+        "aliasResolution": [
+          {
+            "identityGroup": "gpt56_model",
+            "entityIds": [
+              "ent_ae203e4cc6f161af02425fde"
+            ],
+            "expectedType": "Model",
+            "actualAliases": [
+              "GPT-5.6"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-10-preference-repeat",
+      "input": "我现在还是更喜欢 GPT 5.6。",
+      "expectedEntities": [
+        {
+          "name": "小夭",
+          "type": "User"
+        },
+        {
+          "name": "GPT 5.6",
+          "type": "Model"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "GPT 5.6",
+          "type": "Model",
+          "aliases": [
+            "GPT 5.6",
+            "GPT-5.6"
+          ],
+          "identityGroup": "gpt56_model"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "小夭",
+          "type": "prefers",
+          "to": "GPT 5.6"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0,
+        "note": "Same active fact adds provenance without another edge."
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-10-preference-repeat",
+        "entities": [
+          {
+            "name": "小夭",
+            "type": "User",
+            "aliases": []
+          },
+          {
+            "name": "GPT 5.6",
+            "type": "Model",
+            "aliases": [
+              "GPT-5.6"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "from": "小夭",
+            "type": "prefers",
+            "to": "GPT 5.6",
+            "confidence": 0.97,
+            "validFrom": "2026-08-21T08:00:00.000Z"
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 0,
+        "entityMerges": 0,
+        "edgesCreated": 0,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "gpt56_model",
+            "entityIds": [
+              "ent_ae203e4cc6f161af02425fde"
+            ],
+            "expectedType": "Model",
+            "actualAliases": [
+              "GPT-5.6"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-11-user-device",
+      "input": "我的主要电脑是 ThinkPad P1。",
+      "expectedEntities": [
+        {
+          "name": "小夭",
+          "type": "User"
+        },
+        {
+          "name": "ThinkPad P1",
+          "type": "Device"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "ThinkPad P1",
+          "type": "Device",
+          "aliases": [
+            "ThinkPad P1"
+          ],
+          "identityGroup": "thinkpad_p1_device"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "小夭",
+          "type": "owns",
+          "to": "ThinkPad P1"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-11-user-device",
+        "entities": [
+          {
+            "name": "小夭",
+            "type": "User",
+            "aliases": []
+          },
+          {
+            "name": "ThinkPad P1",
+            "type": "Device",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "小夭",
+            "type": "owns",
+            "to": "ThinkPad P1",
+            "confidence": 0.97
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "thinkpad_p1_device",
+            "entityIds": [
+              "ent_8831d4021f35b75bf8dd811b"
+            ],
+            "expectedType": "Device",
+            "actualAliases": [
+              "ThinkPad P1"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-12-device-software",
+      "input": "ThinkPad P1 跑 Windows 11。",
+      "expectedEntities": [
+        {
+          "name": "ThinkPad P1",
+          "type": "Device"
+        },
+        {
+          "name": "Windows 11",
+          "type": "Software"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "Windows 11",
+          "type": "Software",
+          "aliases": [
+            "Windows 11",
+            "Windows"
+          ],
+          "identityGroup": "windows11_software"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "ThinkPad P1",
+          "type": "runs_on",
+          "to": "Windows 11"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-12-device-software",
+        "entities": [
+          {
+            "name": "ThinkPad P1",
+            "type": "Device",
+            "aliases": []
+          },
+          {
+            "name": "Windows 11",
+            "type": "Software",
+            "aliases": [
+              "Windows"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "from": "ThinkPad P1",
+            "type": "runs_on",
+            "to": "Windows 11",
+            "confidence": 0.98
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "windows11_software",
+            "entityIds": [
+              "ent_cc91aecb3c78702fc0a6b47a"
+            ],
+            "expectedType": "Software",
+            "actualAliases": [
+              "Windows",
+              "Windows 11"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-13-user-goal",
+      "input": "我的目标是让 OpenClaw 越聊越了解我，但只在必要时召回。",
+      "expectedEntities": [
+        {
+          "name": "小夭",
+          "type": "User"
+        },
+        {
+          "name": "按需长期个人助理",
+          "type": "Goal"
+        },
+        {
+          "name": "OpenClaw",
+          "type": "Software"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "按需长期个人助理",
+          "type": "Goal",
+          "aliases": [
+            "按需长期个人助理"
+          ],
+          "identityGroup": "on_demand_assistant_goal"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "小夭",
+          "type": "targets",
+          "to": "按需长期个人助理"
+        },
+        {
+          "from": "按需长期个人助理",
+          "type": "related_to",
+          "to": "OpenClaw"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-13-user-goal",
+        "entities": [
+          {
+            "name": "小夭",
+            "type": "User",
+            "aliases": []
+          },
+          {
+            "name": "按需长期个人助理",
+            "type": "Goal",
+            "aliases": []
+          },
+          {
+            "name": "OpenClaw",
+            "type": "Software",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "小夭",
+            "type": "targets",
+            "to": "按需长期个人助理",
+            "confidence": 0.98
+          },
+          {
+            "from": "按需长期个人助理",
+            "type": "related_to",
+            "to": "OpenClaw",
+            "confidence": 0.91
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 2,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "on_demand_assistant_goal",
+            "entityIds": [
+              "ent_4e19ee04434812beb4ba780e"
+            ],
+            "expectedType": "Goal",
+            "actualAliases": [
+              "按需长期个人助理"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-14-published-package",
+      "input": "human-gate 发布在 npm。",
+      "expectedEntities": [
+        {
+          "name": "human-gate",
+          "type": "Project"
+        },
+        {
+          "name": "npm",
+          "type": "Platform"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "npm",
+          "type": "Platform",
+          "aliases": [
+            "npm"
+          ],
+          "identityGroup": "npm_platform"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "human-gate",
+          "type": "published_on",
+          "to": "npm"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-14-published-package",
+        "entities": [
+          {
+            "name": "human-gate",
+            "type": "Project",
+            "aliases": []
+          },
+          {
+            "name": "npm",
+            "type": "Platform",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "human-gate",
+            "type": "published_on",
+            "to": "npm",
+            "confidence": 0.97
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "npm_platform",
+            "entityIds": [
+              "ent_8a79d612a332b9a57d18b9d1"
+            ],
+            "expectedType": "Platform",
+            "actualAliases": [
+              "npm"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-15-project-language",
+      "input": "human-gate 依赖 TypeScript。",
+      "expectedEntities": [
+        {
+          "name": "human-gate",
+          "type": "Project"
+        },
+        {
+          "name": "TypeScript",
+          "type": "Software"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "TypeScript",
+          "type": "Software",
+          "aliases": [
+            "TypeScript",
+            "TS"
+          ],
+          "identityGroup": "typescript_software"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "human-gate",
+          "type": "depends_on",
+          "to": "TypeScript"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-15-project-language",
+        "entities": [
+          {
+            "name": "human-gate",
+            "type": "Project",
+            "aliases": []
+          },
+          {
+            "name": "TypeScript",
+            "type": "Software",
+            "aliases": [
+              "TS"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "from": "human-gate",
+            "type": "depends_on",
+            "to": "TypeScript",
+            "confidence": 0.96
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "typescript_software",
+            "entityIds": [
+              "ent_e9783f50d0118666112af8cc"
+            ],
+            "expectedType": "Software",
+            "actualAliases": [
+              "TS",
+              "TypeScript"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-16-project-openclaw",
+      "input": "human-gate 是 OpenClaw 的审批插件。",
+      "expectedEntities": [
+        {
+          "name": "human-gate",
+          "type": "Project"
+        },
+        {
+          "name": "OpenClaw",
+          "type": "Software"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "human-gate",
+          "type": "Project",
+          "aliases": [
+            "human-gate",
+            "我的审批插件"
+          ],
+          "identityGroup": "human_gate_project"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "human-gate",
+          "type": "related_to",
+          "to": "OpenClaw"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-16-project-openclaw",
+        "entities": [
+          {
+            "name": "human-gate",
+            "type": "Project",
+            "aliases": [
+              "我的审批插件"
+            ]
+          },
+          {
+            "name": "OpenClaw",
+            "type": "Software",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "human-gate",
+            "type": "related_to",
+            "to": "OpenClaw",
+            "confidence": 0.98
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 0,
+        "entityMerges": 0,
+        "edgesCreated": 0,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "human_gate_project",
+            "entityIds": [
+              "ent_a92d6f674c0747d4832f270e"
+            ],
+            "expectedType": "Project",
+            "actualAliases": [
+              "hg",
+              "human-gate",
+              "openclaw-human-gate",
+              "我的审批插件",
+              "那个插件"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-17-ambiguous-plugin",
+      "input": "那个插件还是用 Codex 维护。",
+      "expectedEntities": [
+        {
+          "name": "human-gate",
+          "type": "Project"
+        },
+        {
+          "name": "Codex",
+          "type": "Tool"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "human-gate",
+          "type": "Project",
+          "aliases": [
+            "human-gate",
+            "那个插件"
+          ],
+          "identityGroup": "human_gate_project"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "human-gate",
+          "type": "maintained_with",
+          "to": "Codex"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-17-ambiguous-plugin",
+        "entities": [
+          {
+            "name": "human-gate",
+            "type": "Project",
+            "aliases": [
+              "那个插件"
+            ]
+          },
+          {
+            "name": "Codex",
+            "type": "Tool",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "human-gate",
+            "type": "maintained_with",
+            "to": "Codex",
+            "confidence": 0.9
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 0,
+        "entityMerges": 0,
+        "edgesCreated": 0,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "human_gate_project",
+            "entityIds": [
+              "ent_a92d6f674c0747d4832f270e"
+            ],
+            "expectedType": "Project",
+            "actualAliases": [
+              "hg",
+              "human-gate",
+              "openclaw-human-gate",
+              "我的审批插件",
+              "那个插件"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-18-ambiguous-project",
+      "input": "之前那个项目就是 active-recall，它也用 BGE-M3。",
+      "expectedEntities": [
+        {
+          "name": "active-recall",
+          "type": "Project"
+        },
+        {
+          "name": "BGE-M3",
+          "type": "Model"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "active-recall",
+          "type": "Project",
+          "aliases": [
+            "active-recall",
+            "之前那个项目"
+          ],
+          "identityGroup": "active_recall_project"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "active-recall",
+          "type": "uses",
+          "to": "BGE-M3"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-18-ambiguous-project",
+        "entities": [
+          {
+            "name": "active-recall",
+            "type": "Project",
+            "aliases": [
+              "之前那个项目"
+            ]
+          },
+          {
+            "name": "BGE-M3",
+            "type": "Model",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "active-recall",
+            "type": "uses",
+            "to": "BGE-M3",
+            "confidence": 0.91
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 0,
+        "entityMerges": 0,
+        "edgesCreated": 0,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "active_recall_project",
+            "entityIds": [
+              "ent_0786b3f79a81315283fc7e8d"
+            ],
+            "expectedType": "Project",
+            "actualAliases": [
+              "active-recall",
+              "之前那个项目"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-19-same-name-project",
+      "input": "Atlas 是我正在开发的项目。",
+      "expectedEntities": [
+        {
+          "name": "小夭",
+          "type": "User"
+        },
+        {
+          "name": "Atlas",
+          "type": "Project"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "Atlas",
+          "type": "Project",
+          "aliases": [
+            "Atlas"
+          ],
+          "identityGroup": "atlas_project"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "小夭",
+          "type": "develops",
+          "to": "Atlas"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-19-same-name-project",
+        "entities": [
+          {
+            "name": "小夭",
+            "type": "User",
+            "aliases": []
+          },
+          {
+            "name": "Atlas",
+            "type": "Project",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "小夭",
+            "type": "develops",
+            "to": "Atlas",
+            "confidence": 0.95
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "atlas_project",
+            "entityIds": [
+              "ent_748602437d199d0d9ccedf45"
+            ],
+            "expectedType": "Project",
+            "actualAliases": [
+              "Atlas"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-20-same-name-tool",
+      "input": "Atlas 也是另一个无关的部署工具名，不是刚才的项目。",
+      "expectedEntities": [
+        {
+          "name": "Atlas",
+          "type": "Tool"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "Atlas",
+          "type": "Tool",
+          "aliases": [
+            "Atlas"
+          ],
+          "identityGroup": "atlas_tool"
+        }
+      ],
+      "expectedEdges": [],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-20-same-name-tool",
+        "entities": [
+          {
+            "name": "Atlas",
+            "type": "Tool",
+            "aliases": []
+          }
+        ],
+        "edges": [],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 0,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "atlas_tool",
+            "entityIds": [
+              "ent_71d6203d486ea2a6aa1dba40"
+            ],
+            "expectedType": "Tool",
+            "actualAliases": [
+              "Atlas"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-21-multi-entity",
+      "input": "我在 Windows 11 的 ThinkPad P1 上，用 Codex 维护 active-recall；它用 BGE-M3，并发布为 @openclaw/active-recall 到 npm。",
+      "expectedEntities": [
+        {
+          "name": "小夭",
+          "type": "User"
+        },
+        {
+          "name": "ThinkPad P1",
+          "type": "Device"
+        },
+        {
+          "name": "Windows 11",
+          "type": "Software"
+        },
+        {
+          "name": "Codex",
+          "type": "Tool"
+        },
+        {
+          "name": "active-recall",
+          "type": "Project"
+        },
+        {
+          "name": "BGE-M3",
+          "type": "Model"
+        },
+        {
+          "name": "@openclaw/active-recall",
+          "type": "Software"
+        },
+        {
+          "name": "npm",
+          "type": "Platform"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "@openclaw/active-recall",
+          "type": "Software",
+          "aliases": [
+            "@openclaw/active-recall"
+          ],
+          "identityGroup": "active_recall_package"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "小夭",
+          "type": "works_on",
+          "to": "active-recall"
+        },
+        {
+          "from": "active-recall",
+          "type": "maintained_with",
+          "to": "Codex"
+        },
+        {
+          "from": "active-recall",
+          "type": "uses",
+          "to": "BGE-M3"
+        },
+        {
+          "from": "active-recall",
+          "type": "runs_on",
+          "to": "Windows 11"
+        },
+        {
+          "from": "active-recall",
+          "type": "published_on",
+          "to": "npm"
+        },
+        {
+          "from": "@openclaw/active-recall",
+          "type": "related_to",
+          "to": "active-recall"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-21-multi-entity",
+        "entities": [
+          {
+            "name": "小夭",
+            "type": "User",
+            "aliases": []
+          },
+          {
+            "name": "ThinkPad P1",
+            "type": "Device",
+            "aliases": []
+          },
+          {
+            "name": "Windows 11",
+            "type": "Software",
+            "aliases": []
+          },
+          {
+            "name": "Codex",
+            "type": "Tool",
+            "aliases": []
+          },
+          {
+            "name": "active-recall",
+            "type": "Project",
+            "aliases": []
+          },
+          {
+            "name": "BGE-M3",
+            "type": "Model",
+            "aliases": []
+          },
+          {
+            "name": "@openclaw/active-recall",
+            "type": "Software",
+            "aliases": []
+          },
+          {
+            "name": "npm",
+            "type": "Platform",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "小夭",
+            "type": "works_on",
+            "to": "active-recall",
+            "confidence": 0.97
+          },
+          {
+            "from": "active-recall",
+            "type": "maintained_with",
+            "to": "Codex",
+            "confidence": 0.97
+          },
+          {
+            "from": "active-recall",
+            "type": "uses",
+            "to": "BGE-M3",
+            "confidence": 0.98
+          },
+          {
+            "from": "active-recall",
+            "type": "runs_on",
+            "to": "Windows 11",
+            "confidence": 0.9
+          },
+          {
+            "from": "active-recall",
+            "type": "published_on",
+            "to": "npm",
+            "confidence": 0.93
+          },
+          {
+            "from": "@openclaw/active-recall",
+            "type": "related_to",
+            "to": "active-recall",
+            "confidence": 0.95
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 5,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "active_recall_package",
+            "entityIds": [
+              "ent_bc0237a1f115307df4dcc367"
+            ],
+            "expectedType": "Software",
+            "actualAliases": [
+              "@openclaw/active-recall"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-22-negated-fact",
+      "input": "我没有使用 Kubernetes，别把它记成我的技术栈。",
+      "expectedEntities": [],
+      "expectedAliases": [],
+      "expectedEdges": [],
+      "expectedTemporalBehavior": {
+        "invalidations": 0,
+        "note": "A negated claim must not become a positive uses relation."
+      },
+      "actualResult": {
+        "status": "skipped",
+        "entities": [],
+        "edges": [],
+        "aliasResolution": []
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-23-small-talk",
+      "input": "今天天气真不错。",
+      "expectedEntities": [],
+      "expectedAliases": [],
+      "expectedEdges": [],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "skipped",
+        "entities": [],
+        "edges": [],
+        "aliasResolution": []
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-24-secret-transient",
+      "input": "临时验证码是 123456，五分钟后失效。",
+      "expectedEntities": [],
+      "expectedAliases": [],
+      "expectedEdges": [],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "skipped",
+        "entities": [],
+        "edges": [],
+        "aliasResolution": []
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-25-camelcase-file",
+      "input": "active-recall 的 evaluateRecallDemand() 定义在 demand.ts，并由 before_prompt_build hook 调用。",
+      "expectedEntities": [
+        {
+          "name": "active-recall",
+          "type": "Project"
+        },
+        {
+          "name": "evaluateRecallDemand()",
+          "type": "Tool"
+        },
+        {
+          "name": "demand.ts",
+          "type": "Software"
+        },
+        {
+          "name": "before_prompt_build",
+          "type": "Tool"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "evaluateRecallDemand()",
+          "type": "Tool",
+          "aliases": [
+            "evaluateRecallDemand()",
+            "evaluateRecallDemand"
+          ],
+          "identityGroup": "evaluate_recall_demand_tool"
+        },
+        {
+          "entity": "demand.ts",
+          "type": "Software",
+          "aliases": [
+            "demand.ts"
+          ],
+          "identityGroup": "demand_ts_file"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "active-recall",
+          "type": "depends_on",
+          "to": "evaluateRecallDemand()"
+        },
+        {
+          "from": "evaluateRecallDemand()",
+          "type": "related_to",
+          "to": "demand.ts"
+        },
+        {
+          "from": "before_prompt_build",
+          "type": "uses",
+          "to": "evaluateRecallDemand()"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-25-camelcase-file",
+        "entities": [
+          {
+            "name": "active-recall",
+            "type": "Project",
+            "aliases": []
+          },
+          {
+            "name": "evaluateRecallDemand()",
+            "type": "Tool",
+            "aliases": [
+              "evaluateRecallDemand"
+            ]
+          },
+          {
+            "name": "demand.ts",
+            "type": "Software",
+            "aliases": []
+          },
+          {
+            "name": "before_prompt_build",
+            "type": "Tool",
+            "aliases": [
+              "before_prompt_build hook"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "from": "active-recall",
+            "type": "depends_on",
+            "to": "evaluateRecallDemand()",
+            "confidence": 0.98
+          },
+          {
+            "from": "evaluateRecallDemand()",
+            "type": "related_to",
+            "to": "demand.ts",
+            "confidence": 0.96
+          },
+          {
+            "from": "before_prompt_build",
+            "type": "uses",
+            "to": "evaluateRecallDemand()",
+            "confidence": 0.97
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 3,
+        "entityMerges": 0,
+        "edgesCreated": 3,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "evaluate_recall_demand_tool",
+            "entityIds": [
+              "ent_24ac6a7f1ccf26f602fc6e6f"
+            ],
+            "expectedType": "Tool",
+            "actualAliases": [
+              "evaluateRecallDemand()"
+            ]
+          },
+          {
+            "identityGroup": "demand_ts_file",
+            "entityIds": [
+              "ent_c0b988b7bbbc04a45d4d7794"
+            ],
+            "expectedType": "Software",
+            "actualAliases": [
+              "demand.ts"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-26-windows-path",
+      "input": "active-recall 的开发目录是 C:\\Users\\user\\.openclaw\\workspace\\plugins\\active_recall。",
+      "expectedEntities": [
+        {
+          "name": "active-recall",
+          "type": "Project"
+        },
+        {
+          "name": "C:\\Users\\user\\.openclaw\\workspace\\plugins\\active_recall",
+          "type": "Platform"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "C:\\Users\\user\\.openclaw\\workspace\\plugins\\active_recall",
+          "type": "Platform",
+          "aliases": [
+            "C:\\Users\\user\\.openclaw\\workspace\\plugins\\active_recall",
+            "workspace/plugins/active_recall"
+          ],
+          "identityGroup": "active_recall_dev_path"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "active-recall",
+          "type": "runs_on",
+          "to": "C:\\Users\\user\\.openclaw\\workspace\\plugins\\active_recall"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-26-windows-path",
+        "entities": [
+          {
+            "name": "active-recall",
+            "type": "Project",
+            "aliases": []
+          },
+          {
+            "name": "C:\\Users\\user\\.openclaw\\workspace\\plugins\\active_recall",
+            "type": "Platform",
+            "aliases": [
+              "workspace/plugins/active_recall"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "from": "active-recall",
+            "type": "runs_on",
+            "to": "C:\\Users\\user\\.openclaw\\workspace\\plugins\\active_recall",
+            "confidence": 0.9
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "active_recall_dev_path",
+            "entityIds": [
+              "ent_bd1167978ece36e9de04f6bf"
+            ],
+            "expectedType": "Platform",
+            "actualAliases": [
+              "C:\\Users\\user\\.openclaw\\workspace\\plugins\\active_recall",
+              "workspace/plugins/active_recall"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-27-scoped-package",
+      "input": "npm 包名必须保留为 @openclaw/active-recall，不要去掉 scope。",
+      "expectedEntities": [
+        {
+          "name": "@openclaw/active-recall",
+          "type": "Software"
+        },
+        {
+          "name": "npm",
+          "type": "Platform"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "@openclaw/active-recall",
+          "type": "Software",
+          "aliases": [
+            "@openclaw/active-recall"
+          ],
+          "identityGroup": "active_recall_package"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "@openclaw/active-recall",
+          "type": "published_on",
+          "to": "npm"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-27-scoped-package",
+        "entities": [
+          {
+            "name": "@openclaw/active-recall",
+            "type": "Software",
+            "aliases": []
+          },
+          {
+            "name": "npm",
+            "type": "Platform",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "@openclaw/active-recall",
+            "type": "published_on",
+            "to": "npm",
+            "confidence": 0.98
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 0,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "active_recall_package",
+            "entityIds": [
+              "ent_bc0237a1f115307df4dcc367"
+            ],
+            "expectedType": "Software",
+            "actualAliases": [
+              "@openclaw/active-recall"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-28-local-preference",
+      "input": "我偏好本地可部署、低延迟、可回滚的方案。",
+      "expectedEntities": [
+        {
+          "name": "小夭",
+          "type": "User"
+        },
+        {
+          "name": "本地低延迟可回滚",
+          "type": "Preference"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "本地低延迟可回滚",
+          "type": "Preference",
+          "aliases": [
+            "本地低延迟可回滚",
+            "本地可部署"
+          ],
+          "identityGroup": "local_rollback_preference"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "小夭",
+          "type": "prefers",
+          "to": "本地低延迟可回滚"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 1,
+        "note": "Exclusive prefers relation closes the prior GPT-5.6 preference."
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-28-local-preference",
+        "entities": [
+          {
+            "name": "小夭",
+            "type": "User",
+            "aliases": []
+          },
+          {
+            "name": "本地低延迟可回滚",
+            "type": "Preference",
+            "aliases": [
+              "本地可部署"
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "from": "小夭",
+            "type": "prefers",
+            "to": "本地低延迟可回滚",
+            "confidence": 0.97,
+            "validFrom": "2026-08-19T09:00:00.000Z"
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 1,
+        "aliasResolution": [
+          {
+            "identityGroup": "local_rollback_preference",
+            "entityIds": [
+              "ent_76ebe80d86c62126cab7ce10"
+            ],
+            "expectedType": "Preference",
+            "actualAliases": [
+              "本地低延迟可回滚",
+              "本地可部署"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-29-goal-change",
+      "input": "以前先验证 read，现在换成先把 writer 质量和回滚做扎实。",
+      "expectedEntities": [
+        {
+          "name": "小夭",
+          "type": "User"
+        },
+        {
+          "name": "Graph writer 质量与回滚",
+          "type": "Goal"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "Graph writer 质量与回滚",
+          "type": "Goal",
+          "aliases": [
+            "Graph writer 质量与回滚"
+          ],
+          "identityGroup": "writer_quality_goal"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "小夭",
+          "type": "targets",
+          "to": "Graph writer 质量与回滚"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0,
+        "note": "targets is not exclusive in v1; the previous goal stays as history/context."
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-29-goal-change",
+        "entities": [
+          {
+            "name": "小夭",
+            "type": "User",
+            "aliases": []
+          },
+          {
+            "name": "Graph writer 质量与回滚",
+            "type": "Goal",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "小夭",
+            "type": "targets",
+            "to": "Graph writer 质量与回滚",
+            "confidence": 0.98,
+            "validFrom": "2026-08-22T09:00:00.000Z"
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 1,
+        "entityMerges": 0,
+        "edgesCreated": 1,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "writer_quality_goal",
+            "entityIds": [
+              "ent_8d9f93d8fe4a32d2b2f26756"
+            ],
+            "expectedType": "Goal",
+            "actualAliases": [
+              "Graph writer 质量与回滚"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    },
+    {
+      "id": "quality-30-dense-technical",
+      "input": "Graph Memory writer 从 agent_end 异步触发，写 local-sqlite，保留 episode provenance；active-recall read 仍关闭，BGE-M3 继续负责 vector memory。",
+      "expectedEntities": [
+        {
+          "name": "Graph Memory writer",
+          "type": "Project"
+        },
+        {
+          "name": "agent_end",
+          "type": "Tool"
+        },
+        {
+          "name": "local-sqlite",
+          "type": "Software"
+        },
+        {
+          "name": "episode provenance",
+          "type": "Goal"
+        },
+        {
+          "name": "active-recall",
+          "type": "Project"
+        },
+        {
+          "name": "BGE-M3",
+          "type": "Model"
+        },
+        {
+          "name": "vector memory",
+          "type": "Software"
+        }
+      ],
+      "expectedAliases": [
+        {
+          "entity": "agent_end",
+          "type": "Tool",
+          "aliases": [
+            "agent_end"
+          ],
+          "identityGroup": "agent_end_hook"
+        },
+        {
+          "entity": "local-sqlite",
+          "type": "Software",
+          "aliases": [
+            "local-sqlite",
+            "SQLite"
+          ],
+          "identityGroup": "local_sqlite"
+        }
+      ],
+      "expectedEdges": [
+        {
+          "from": "Graph Memory writer",
+          "type": "uses",
+          "to": "agent_end"
+        },
+        {
+          "from": "Graph Memory writer",
+          "type": "runs_on",
+          "to": "local-sqlite"
+        },
+        {
+          "from": "Graph Memory writer",
+          "type": "targets",
+          "to": "episode provenance"
+        },
+        {
+          "from": "active-recall",
+          "type": "uses",
+          "to": "BGE-M3"
+        },
+        {
+          "from": "BGE-M3",
+          "type": "related_to",
+          "to": "vector memory"
+        }
+      ],
+      "expectedTemporalBehavior": {
+        "invalidations": 0
+      },
+      "actualResult": {
+        "status": "written",
+        "episodeId": "quality-30-dense-technical",
+        "entities": [
+          {
+            "name": "Graph Memory writer",
+            "type": "Project",
+            "aliases": []
+          },
+          {
+            "name": "agent_end",
+            "type": "Tool",
+            "aliases": []
+          },
+          {
+            "name": "local-sqlite",
+            "type": "Software",
+            "aliases": [
+              "SQLite"
+            ]
+          },
+          {
+            "name": "episode provenance",
+            "type": "Goal",
+            "aliases": []
+          },
+          {
+            "name": "active-recall",
+            "type": "Project",
+            "aliases": []
+          },
+          {
+            "name": "BGE-M3",
+            "type": "Model",
+            "aliases": []
+          },
+          {
+            "name": "vector memory",
+            "type": "Software",
+            "aliases": []
+          }
+        ],
+        "edges": [
+          {
+            "from": "Graph Memory writer",
+            "type": "uses",
+            "to": "agent_end",
+            "confidence": 0.98
+          },
+          {
+            "from": "Graph Memory writer",
+            "type": "runs_on",
+            "to": "local-sqlite",
+            "confidence": 0.97
+          },
+          {
+            "from": "Graph Memory writer",
+            "type": "targets",
+            "to": "episode provenance",
+            "confidence": 0.94
+          },
+          {
+            "from": "active-recall",
+            "type": "uses",
+            "to": "BGE-M3",
+            "confidence": 0.99
+          },
+          {
+            "from": "BGE-M3",
+            "type": "related_to",
+            "to": "vector memory",
+            "confidence": 0.96
+          }
+        ],
+        "idempotent": false,
+        "entitiesCreated": 4,
+        "entityMerges": 0,
+        "edgesCreated": 4,
+        "temporalInvalidations": 0,
+        "aliasResolution": [
+          {
+            "identityGroup": "agent_end_hook",
+            "entityIds": [
+              "ent_6b14aac5d1de37bd33548224"
+            ],
+            "expectedType": "Tool",
+            "actualAliases": [
+              "agent_end"
+            ]
+          },
+          {
+            "identityGroup": "local_sqlite",
+            "entityIds": [
+              "ent_7c71c3b85e3e470787ac85d8"
+            ],
+            "expectedType": "Software",
+            "actualAliases": [
+              "SQLite",
+              "local-sqlite"
+            ]
+          }
+        ]
+      },
+      "pass": true,
+      "failures": []
+    }
+  ]
+}

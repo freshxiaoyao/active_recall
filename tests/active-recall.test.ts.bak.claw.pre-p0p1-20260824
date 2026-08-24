@@ -1,0 +1,626 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { cleanPromptForSearch } from "../clean-prompt.js";
+import { readConfig } from "../config.js";
+import { evaluateRecallDemand } from "../demand.js";
+import { buildExpansionSearchRoutes, expandQuery, parseExpansionContent } from "../expansion.js";
+import { canonicalPath, fuseRoutes, isStrongSignal, passesQualityGate, successfulRoutes } from "../fusion.js";
+import { injectContext, isInternalSession, runRecall } from "../index.js";
+import { evaluateSemanticRecall, parseSemanticGateContent } from "../semantic-gate.js";
+import type { SearchRoute } from "../fusion.js";
+
+const route = (name: string, hits: Array<{ path: string; score: number; source?: string; snippet?: string; line?: number }>, weight = 1): SearchRoute => ({
+  route: name,
+  weight,
+  result: {
+    hits: hits.map((hit) => ({ ...hit, snippet: hit.snippet ?? `${hit.path} snippet`, source: hit.source ?? "memory" })),
+    timing: { spawnMs: 1, searchMs: 1, totalMs: 2 },
+    rawOutput: "[]",
+  },
+});
+
+const searchResult = (hits: Array<{ path: string; score: number; source?: string; snippet?: string; line?: number }>) => route("mock", hits).result;
+const pluginApi = { on: () => undefined, logger: { error: () => undefined } };
+const recallCtx = { agentId: "main", sessionKey: "agent:main:user-test" };
+
+test("cleanPromptForSearch strips documented OpenClaw artifacts", () => {
+  const fixtures = [
+    { name: "recall and vault blocks", input: "question\n<recall-context>old recall</recall-context>\n<vault-memory>old vault</vault-memory>", expected: "question" },
+    { name: "sender metadata JSON", input: "Sender (untrusted metadata)\n{\n  \"name\": \"ignored\"\n}\n\nquestion", expected: "question" },
+    { name: "runtime metadata JSON", input: "OpenClaw runtime context (internal)\n{\n  \"session\": \"ignored\"\n}\nquestion", expected: "question" },
+    { name: "system and timestamp", input: "System: internal instruction\n[Sat 2026-08-16 05:50 GMT+8] what did we decide?", expected: "what did we decide?" },
+    { name: "empty after cleanup", input: "<recall-context>only context</recall-context>\n\nSystem: no", expected: "" },
+  ];
+  for (const fixture of fixtures) assert.equal(cleanPromptForSearch(fixture.input), fixture.expected, fixture.name);
+});
+
+test("internal memory, heartbeat, cron, and dreaming sessions never recall", () => {
+  for (const session of [
+    "agent:main:active-memory:child",
+    "agent:main:heartbeat",
+    "agent:main:cron:job",
+    "agent:main:dreaming-narrative-light-123",
+  ]) assert.equal(isInternalSession(session), true, session);
+  assert.equal(isInternalSession("agent:main:dashboard:user-session"), false);
+});
+
+test("on-demand trigger skips standalone messages before retrieval", () => {
+  const trigger = readConfig({}).trigger;
+  for (const prompt of ["帮我优化一下这个插件", "介绍一下 TypeScript 泛型", "thanks", "检查当前代码的类型错误"]) {
+    const expected = prompt === "帮我优化一下这个插件" || prompt === "检查当前代码的类型错误" ? "uncertain" : "no";
+    assert.equal(evaluateRecallDemand(prompt, trigger).decision, expected, prompt);
+  }
+});
+
+test("ordinary knowledge and generic historical questions take the zero-LLM no path", () => {
+  const trigger = readConfig({}).trigger;
+  for (const prompt of [
+    "什么是 RRF？",
+    "以前的人怎么保存食物？",
+    "以前的人怎么保存食物？简单说说。",
+    "你说说以前的人怎么保存食物。",
+    "以前的项目管理方法有哪些？",
+    "How did people preserve food previously? Can you explain?",
+    "How does a B-tree work?",
+  ]) {
+    assert.equal(evaluateRecallDemand(prompt, trigger).decision, "no", prompt);
+  }
+});
+
+test("on-demand trigger recognizes memory-dependent Chinese and English prompts", () => {
+  const trigger = readConfig({}).trigger;
+  const fixtures = [
+    "还记得我们上次给 human-gate 定的规则吗？",
+    "上次我们改过的那个插件现在怎样？",
+    "以前我们讨论过 human-gate 的哪些规则？",
+    "我们以前讨论过 human-gate 的哪些规则？",
+    "那个审批插件现在推进到哪一步了？",
+    "按我之前的偏好继续调整配置",
+    "What did we decide last time about human-gate?",
+    "Can you still remember our deployment plan?",
+    "What is the status of that plugin now?",
+  ];
+  for (const prompt of fixtures) assert.equal(evaluateRecallDemand(prompt, trigger).decision, "yes", prompt);
+});
+
+test("vague continuation uses semantic fallback instead of forcing recall", () => {
+  const trigger = readConfig({}).trigger;
+  for (const prompt of ["帮我把这个方案落地", "继续优化这个插件", "Tune this current implementation"]) {
+    assert.equal(evaluateRecallDemand(prompt, trigger).decision, "uncertain", prompt);
+  }
+});
+
+test("explicit prefixes force recall and are removed from the search query", () => {
+  const trigger = readConfig({}).trigger;
+  assert.deepEqual(evaluateRecallDemand("/recall   human-gate decisions", trigger), {
+    decision: "yes",
+    query: "human-gate decisions",
+    reason: "explicit_prefix",
+    confidence: 1,
+    depth: undefined,
+  });
+  assert.deepEqual(evaluateRecallDemand("/recall deep human-gate decisions", trigger), {
+    decision: "yes", query: "human-gate decisions", reason: "explicit_prefix", confidence: 1, depth: "deep",
+  });
+  assert.equal(evaluateRecallDemand("/recaller is a command name", trigger).decision, "no");
+});
+
+test("explicit and always modes plus suppression remain configurable", () => {
+  const explicit = readConfig({ trigger: { mode: "explicit", additionalKeywords: ["project atlas"] } }).trigger;
+  assert.equal(evaluateRecallDemand("还记得我们上次的决定吗？", explicit).decision, "no");
+  assert.equal(evaluateRecallDemand("project atlas progress", explicit).reason, "custom_keyword");
+
+  const always = readConfig({ trigger: { mode: "always" } }).trigger;
+  assert.equal(evaluateRecallDemand("普通独立问题", always).reason, "always");
+  assert.deepEqual(evaluateRecallDemand("/no-recall 普通独立问题", always), {
+    decision: "no",
+    query: "普通独立问题",
+    reason: "suppressed",
+    confidence: 1,
+    depth: "none",
+  });
+});
+
+test("RRF ranks a repeated result before one literal-only result", () => {
+  const fused = fuseRoutes([
+    route("literal", [{ path: "a", score: 0.9 }, { path: "b", score: 0.8 }], 2),
+    route("rewrite", [{ path: "b", score: 0.7 }, { path: "c", score: 0.6 }]),
+  ], { k: 60, preferSources: { memory: 1 }, snippetChars: 100, topK: 5 });
+  assert.deepEqual(fused.map((hit) => hit.path), ["b", "a", "c"]);
+  assert.equal(fused[0].routeHits, 2);
+});
+
+test("same-path chunks contribute once per route and keep the highest-score chunk atomically", () => {
+  const fused = fuseRoutes([route("literal", [
+    { path: "memory\\same.md", score: 0.6, snippet: "long but weaker snippet", line: 10 },
+    { path: "memory/same.md", score: 0.8, snippet: "best snippet", line: 42 },
+  ], 2)], { k: 20, preferSources: { memory: 1 }, snippetChars: 100, topK: 5 });
+  assert.equal(fused.length, 1);
+  assert.equal(fused[0].routeHits, 1);
+  assert.equal(fused[0].occurrences, 2);
+  assert.equal(fused[0].bestRawScore, 0.8);
+  assert.equal(fused[0].snippet, "best snippet");
+  assert.equal(fused[0].line, 42);
+  assert.deepEqual(fused[0].routes, ["literal"]);
+  assert.equal(fused[0].rrfScore, 2 / 21);
+});
+
+test("same path across distinct routes counts as route consensus", () => {
+  const fused = fuseRoutes([
+    route("literal", [{ path: "memory/same.md", score: 0.8 }], 2),
+    route("rewrite", [{ path: "memory/same.md", score: 0.75 }]),
+  ], { k: 20, preferSources: { memory: 1 }, snippetChars: 100, topK: 5 });
+  assert.equal(fused[0].routeHits, 2);
+  assert.deepEqual(fused[0].routes, ["literal", "rewrite"]);
+});
+
+test("quality gate accepts high raw or medium raw with independent-route consensus", () => {
+  const fused = fuseRoutes([route("literal", [
+    { path: "weak", score: 0.649 },
+    { path: "kept", score: 0.65 },
+  ])], {
+    k: 20, preferSources: { memory: 1 }, snippetChars: 100, topK: 5, minRawScore: 0.55,
+    qualityGate: { highRawScore: 0.65, mediumRawScore: 0.55, minRouteHits: 2 },
+  });
+  assert.deepEqual(fused.map((hit) => hit.path), ["kept"]);
+
+  const consensus = fuseRoutes([
+    route("literal", [{ path: "medium", score: 0.6 }]),
+    route("rewrite", [{ path: "medium", score: 0.58 }]),
+  ], {
+    k: 20, preferSources: { memory: 1 }, snippetChars: 100, topK: 5, minRawScore: 0.55,
+    qualityGate: { highRawScore: 0.65, mediumRawScore: 0.55, minRouteHits: 2 },
+  });
+  assert.deepEqual(consensus.map((hit) => hit.path), ["medium"]);
+  assert.equal(passesQualityGate(consensus[0], { highRawScore: 0.65, mediumRawScore: 0.55, minRouteHits: 2 }), true);
+});
+
+test("raw-score blend prefers stronger evidence at equal RRF rank", () => {
+  const fused = fuseRoutes([
+    route("low", [{ path: "a-low", score: 0.65 }]),
+    route("high", [{ path: "z-high", score: 0.9 }]),
+  ], { k: 20, preferSources: { memory: 1 }, snippetChars: 100, topK: 5, rawScoreBlend: 0.5 });
+  assert.deepEqual(fused.map((hit) => hit.path), ["z-high", "a-low"]);
+});
+
+test("expanded routes exclude literal-equivalent and duplicate generated queries", () => {
+  const routes = buildExpansionSearchRoutes("Human Gate status", {
+    rewrite: "  human   gate STATUS ",
+    associations: [
+      { type: "project", query: "approval firewall progress" },
+      { type: "history", query: "Approval Firewall Progress" },
+    ],
+  });
+  assert.deepEqual(routes, [{ route: "assoc:project", query: "approval firewall progress", weight: 1 }]);
+});
+
+test("strong signal dedupes paths and uses source-aware calibration", () => {
+  const settings = {
+    enabled: true, minScore: 0.85, gap: 0.15,
+    sources: {
+      memory: { minScore: 0.85, gap: 0.15 },
+      documents: { minScore: 0.87, gap: 0.15 },
+      sessions: { minScore: 0.92, gap: 0.2 },
+      default: { minScore: 0.87, gap: 0.15 },
+    },
+  };
+  assert.equal(isStrongSignal(route("x", [{ path: "memory/a.md", score: 0.85 }, { path: "memory/b.md", score: 0.70 }]).result.hits, settings), true);
+  assert.equal(isStrongSignal(route("x", [{ path: "memory/a.md", score: 0.85 }, { path: "memory/b.md", score: 0.701 }]).result.hits, settings), false);
+  assert.equal(isStrongSignal(route("x", [{ path: "a", score: 0.9, source: "sessions" }]).result.hits, settings), false);
+  assert.equal(isStrongSignal(route("x", [{ path: "docs/project.md", score: 0.86 }]).result.hits, settings), false);
+  assert.equal(isStrongSignal(route("x", [{ path: "docs/project.md", score: 0.87 }]).result.hits, settings), true);
+  assert.equal(isStrongSignal(route("x", [
+    { path: "memory/a.md", score: 0.9 }, { path: "memory/a.md", score: 0.82 }, { path: "memory/b.md", score: 0.7 },
+  ]).result.hits, settings), true);
+  assert.equal(isStrongSignal(route("x", [
+    { path: "session", score: 0.95, source: "sessions" }, { path: "memory", score: 0.7 },
+  ]).result.hits, settings), true);
+  assert.equal(isStrongSignal(route("x", [
+    { path: "session", score: 0.95, source: "sessions" }, { path: "memory", score: 0.8 },
+  ]).result.hits, settings), false);
+});
+
+test("expansion reports timeout and parse failures precisely", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => { throw new DOMException("timed out", "TimeoutError"); };
+    const timeout = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.equal(timeout.status, "timeout");
+    assert.deepEqual(timeout.diagnostics, { parseMode: "none", contentChars: 0, failureReason: "timeout" });
+    globalThis.fetch = async () => new Response(JSON.stringify({ choices: [{ message: { content: "not json" } }] }), { status: 200 });
+    const malformed = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.equal(malformed.status, "parse_fail");
+    assert.equal(malformed.diagnostics.failureReason, "json_syntax_fail");
+    assert.equal(malformed.result, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("expansion safely recovers fenced and prose-wrapped nested JSON", async () => {
+  const originalFetch = globalThis.fetch;
+  const response = (content: string) => new Response(JSON.stringify({
+    choices: [{ finish_reason: "stop", message: { content } }],
+  }), { status: 200 });
+  try {
+    globalThis.fetch = async () => response('```json\n{"rewrite":"project status","associations":[{"type":"project","query":"human gate"}]}\n```');
+    const fenced = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.equal(fenced.status, "repair_success");
+    assert.equal(fenced.diagnostics.parseMode, "fence");
+    assert.equal(fenced.result?.associations[0]?.query, "human gate");
+
+    globalThis.fetch = async () => response('note {} then {"rewrite":"object {shape} history","associations":[]} trailing');
+    const balanced = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.equal(balanced.status, "repair_success");
+    assert.equal(balanced.diagnostics.parseMode, "balanced");
+    assert.equal(balanced.result?.rewrite, "object {shape} history");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("expansion keeps a valid rewrite when associations are missing or partly invalid", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: {
+      content: '{"rewrite":"project status"}',
+    } }] }), { status: 200 });
+    const missing = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.deepEqual(missing.result, { rewrite: "project status", associations: [] });
+    assert.equal(missing.status, "partial_parse");
+    assert.equal(missing.diagnostics.parseMode, "strict");
+
+    globalThis.fetch = async () => new Response(JSON.stringify({ choices: [{ message: {
+      content: '{"rewrite":"project status","associations":[{"type":7,"query":"bad"}]}',
+    } }] }), { status: 200 });
+    const partial = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.deepEqual(partial.result, { rewrite: "project status", associations: [] });
+    assert.equal(partial.status, "partial_parse");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("expansion keeps associations without rewrite and marks unrecoverable truncation", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: {
+      content: '{"associations":[{"type":"project","query":"human gate decision"}]}',
+    } }] }), { status: 200 });
+    const schema = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.equal(schema.status, "partial_parse");
+    assert.deepEqual(schema.result, { rewrite: "", associations: [{ type: "project", query: "human gate decision" }] });
+
+    globalThis.fetch = async () => new Response(JSON.stringify({ choices: [{ finish_reason: "length", message: {
+      content: '{"rewrite":"unfinished"',
+    } }] }), { status: 200 });
+    const closable = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.equal(closable.status, "repair_success");
+    assert.equal(closable.result?.rewrite, "unfinished");
+    assert.equal(closable.diagnostics.finishReason, "length");
+
+    globalThis.fetch = async () => new Response(JSON.stringify({ choices: [{ finish_reason: "length", message: {
+      content: '{"rewrite":"unfinished',
+    } }] }), { status: 200 });
+    const truncated = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.equal(truncated.status, "parse_fail");
+    assert.equal(truncated.diagnostics.failureReason, "truncated");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("expansion distinguishes HTTP and payload failures without retaining response content", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response("rate limited", { status: 429 });
+    const http = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.equal(http.status, "http_fail");
+    assert.equal(http.diagnostics.httpStatus, 429);
+    assert.equal("content" in http.diagnostics, false);
+
+    globalThis.fetch = async () => new Response("not a response payload", { status: 200 });
+    const payload = await expandQuery("message", readConfig({}).expansion, 1);
+    assert.equal(payload.status, "payload_fail");
+    assert.deepEqual(payload.diagnostics, { parseMode: "none", contentChars: 0, failureReason: "payload_fail" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("expansion repairs trailing commas and incomplete outer containers", () => {
+  const trailing = parseExpansionContent('{"rewrite":"project status","associations":[],}', 1);
+  assert.equal(trailing.status, "repair_success");
+  assert.equal(trailing.diagnostics.parseMode, "repair");
+  assert.equal(trailing.result?.rewrite, "project status");
+
+  const unclosed = parseExpansionContent('{"rewrite":"project status","associations":[]', 1);
+  assert.equal(unclosed.status, "repair_success");
+  assert.equal(unclosed.result?.rewrite, "project status");
+});
+
+test("expansion treats empty associations as structured and drops only invalid items", () => {
+  const empty = parseExpansionContent('{"rewrite":"project status","associations":[]}', 1);
+  assert.equal(empty.status, "structured_ok");
+  assert.deepEqual(empty.result?.associations, []);
+
+  const mixed = parseExpansionContent('{"rewrite":"project status","associations":[{"type":7,"query":"bad"},{"type":"decision","query":"approval policy"}]}', 1);
+  assert.equal(mixed.status, "partial_parse");
+  assert.deepEqual(mixed.result?.associations, [{ type: "decision", query: "approval policy" }]);
+
+  const missing = parseExpansionContent('{"associations":[]}', 1);
+  assert.equal(missing.status, "parse_fail");
+  assert.equal(missing.diagnostics.failureReason, "schema_fail");
+});
+
+test("json_schema response format is used only when configured", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestBody: Record<string, unknown> | undefined;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{"rewrite":"x","associations":[]}' } }] }), { status: 200 });
+    };
+    await expandQuery("message", readConfig({ expansion: { responseFormat: "json_schema" } }).expansion, 1);
+    assert.equal((requestBody?.response_format as { type?: string })?.type, "json_schema");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("structured helper calls disable DeepSeek thinking and accept text content parts", async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies: Array<Record<string, unknown>> = [];
+  try {
+    globalThis.fetch = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      const gate = bodies.length === 1;
+      const content = gate
+        ? '{"recall":true,"depth":"literal","reason":"prior project"}'
+        : '{"rewrite":"project status","associations":[]}';
+      return new Response(JSON.stringify({
+        choices: [{ finish_reason: "stop", message: { content: [{ type: "text", text: content }] } }],
+      }), { status: 200 });
+    };
+    const config = readConfig({});
+    const gate = await evaluateSemanticRecall("continue this project", config.expansion, config.semanticGate);
+    const expansion = await expandQuery("continue this project", config.expansion, 1);
+    assert.equal(gate.status, "structured_ok");
+    assert.equal(gate.contentType, "array");
+    assert.equal(expansion.status, "structured_ok");
+    assert.equal(expansion.diagnostics.contentType, "array");
+    for (const body of bodies) assert.deepEqual(body.thinking, { type: "disabled" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("thinking auto mode omits provider-specific fields for non-DeepSeek endpoints", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestBody: Record<string, unknown> | undefined;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{"rewrite":"x","associations":[]}' } }] }), { status: 200 });
+    };
+    const config = readConfig({ expansion: { endpoint: "https://compatible.example/v1" } });
+    await expandQuery("message", config.expansion, 1);
+    assert.equal("thinking" in (requestBody ?? {}), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reasoning-only payload failures expose safe response-shape diagnostics", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      choices: [{ finish_reason: "length", message: { content: null, reasoning_content: "private reasoning omitted" } }],
+    }), { status: 200 });
+    const config = readConfig({});
+    const gate = await evaluateSemanticRecall("continue this project", config.expansion, config.semanticGate);
+    const expansion = await expandQuery("continue this project", config.expansion, 1);
+    assert.equal(gate.status, "payload_fail");
+    assert.equal(gate.contentType, "null");
+    assert.equal(gate.finishReason, "length");
+    assert.equal(gate.hasReasoningContent, true);
+    assert.equal(expansion.status, "payload_fail");
+    assert.equal(expansion.diagnostics.contentType, "null");
+    assert.equal(expansion.diagnostics.finishReason, "length");
+    assert.equal(expansion.diagnostics.hasReasoningContent, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("semantic gate validates depth and only repairs bounded JSON", () => {
+  assert.deepEqual(parseSemanticGateContent('{"recall":true,"depth":"balanced","reason":"depends on project decision"}'), {
+    result: { recall: true, depth: "balanced", reason: "depends on project decision" },
+    status: "structured_ok",
+    parseMode: "strict",
+  });
+  const no = parseSemanticGateContent('note: {"recall":false,"depth":"literal","reason":"generic question"}');
+  assert.equal(no.status, "repair_success");
+  assert.deepEqual(no.result, { recall: false, depth: "none", reason: "generic question" });
+  assert.equal(parseSemanticGateContent('{"recall":true,"depth":"none","reason":"bad"}').status, "parse_fail");
+});
+
+test("semantic gate timeout is short and fail-open", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => { throw new DOMException("timed out", "TimeoutError"); };
+    const config = readConfig({});
+    const attempt = await evaluateSemanticRecall("continue this project", config.expansion, config.semanticGate);
+    assert.equal(attempt.status, "timeout");
+    assert.equal(attempt.result, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runRecall performs zero search and zero semantic call for ordinary knowledge", async () => {
+  let searches = 0;
+  let gates = 0;
+  const config = readConfig({ trace: { enabled: false } });
+  const result = await runRecall(pluginApi, { prompt: "什么是 RRF？" }, recallCtx, config, {
+    search: async () => { searches += 1; throw new Error("must not search"); },
+    semanticGate: async () => { gates += 1; throw new Error("must not gate"); },
+  });
+  assert.equal(result, undefined);
+  assert.equal(searches, 0);
+  assert.equal(gates, 0);
+});
+
+test("runRecall skips expansion for a strong literal hit", async () => {
+  let searches = 0;
+  let expansions = 0;
+  const config = readConfig({ trace: { enabled: false } });
+  const result = await runRecall(pluginApi, { prompt: "/recall remembered project" }, recallCtx, config, {
+    search: async () => { searches += 1; return searchResult([{ path: "memory/project.md", score: 0.9 }]); },
+    expand: async () => { expansions += 1; throw new Error("must not expand"); },
+  });
+  assert.ok(result?.prependContext.includes("memory/project.md"));
+  assert.equal(searches, 1);
+  assert.equal(expansions, 0);
+});
+
+test("runRecall uses semantic gate only for uncertain prompts", async () => {
+  let gates = 0;
+  const config = readConfig({ trace: { enabled: false } });
+  const result = await runRecall(pluginApi, { prompt: "继续优化这个插件" }, recallCtx, config, {
+    semanticGate: async () => {
+      gates += 1;
+      return { result: { recall: true, depth: "literal", reason: "depends on prior plugin work" }, status: "structured_ok", parseMode: "strict" };
+    },
+    search: async () => searchResult([{ path: "memory/plugin.md", score: 0.9 }]),
+  });
+  assert.equal(gates, 1);
+  assert.ok(result?.prependContext.includes("memory/plugin.md"));
+});
+
+test("runRecall falls back to literal immediately when expansion times out", async () => {
+  let searches = 0;
+  const config = readConfig({ trace: { enabled: false } });
+  const result = await runRecall(pluginApi, { prompt: "/recall project decision" }, recallCtx, config, {
+    search: async () => { searches += 1; return searchResult([{ path: "memory/decision.md", score: 0.7 }]); },
+    expand: async () => ({
+      result: null, status: "timeout", diagnostics: { parseMode: "none", contentChars: 0, failureReason: "timeout" },
+    }),
+  });
+  assert.equal(searches, 1);
+  assert.ok(result?.prependContext.includes("memory/decision.md"));
+});
+
+test("runRecall admits a medium raw hit only after expansion route consensus", async () => {
+  let searches = 0;
+  const config = readConfig({ trace: { enabled: false } });
+  const result = await runRecall(pluginApi, { prompt: "/recall project decision" }, recallCtx, config, {
+    search: async () => {
+      searches += 1;
+      return searches === 1
+        ? searchResult([{ path: "memory/decision.md", score: 0.6 }])
+        : searchResult([{ path: "memory/decision.md", score: 0.58 }]);
+    },
+    expand: async () => ({
+      result: { rewrite: "approval project decision", associations: [] },
+      status: "structured_ok",
+      diagnostics: { parseMode: "strict", contentChars: 64 },
+    }),
+  });
+  assert.equal(searches, 2);
+  assert.ok(result?.prependContext.includes("memory/decision.md"));
+});
+
+test("runRecall keeps fail-open when literal search throws", async () => {
+  const config = readConfig({ trace: { enabled: false } });
+  const result = await runRecall(pluginApi, { prompt: "/recall project decision" }, recallCtx, config, {
+    search: async () => { throw new Error("backend unavailable"); },
+  });
+  assert.equal(result, undefined);
+});
+
+test("runRecall trace includes phase latency and separated rank metrics", async () => {
+  const temp = await mkdtemp(join(tmpdir(), "active-recall-trace-"));
+  const file = join(temp, "trace.jsonl");
+  try {
+    const config = readConfig({ trace: { enabled: true, file } });
+    await runRecall(pluginApi, { prompt: "/recall trace fields" }, recallCtx, config, {
+      search: async () => searchResult([{ path: "memory/trace.md", score: 0.9 }]),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const record = JSON.parse((await readFile(file, "utf8")).trim()) as Record<string, unknown>;
+    for (const field of ["literalMs", "gateMs", "expansionMs", "searchMs", "fusionMs", "totalMs"]) {
+      assert.equal(typeof record[field], "number", field);
+    }
+    const top = (record.fusionTop as Array<Record<string, unknown>>)[0];
+    assert.equal(typeof top.bestRawScore, "number");
+    assert.equal(typeof top.rrfScore, "number");
+    assert.equal(typeof top.finalRankScore, "number");
+    assert.equal(top.finalRankScore, top.finalScore);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("allSettled partial fusion preserves successful routes", () => {
+  const settled: PromiseSettledResult<SearchRoute>[] = [
+    { status: "fulfilled", value: route("literal", [{ path: "kept", score: 0.8 }], 2) },
+    { status: "rejected", reason: new Error("timeout") },
+  ];
+  const fused = fuseRoutes(successfulRoutes(settled), { k: 60, preferSources: { memory: 1 }, snippetChars: 50, topK: 5 });
+  assert.equal(fused.length, 1);
+  assert.equal(fused[0].path, "kept");
+});
+
+test("fusion finalRankScore is the descending sort key and finalScore remains compatible", () => {
+  const fused = fuseRoutes([
+    route("first", [{ path: "low-raw-high-weight", score: 0.1, source: "memory" }]),
+    route("second", [{ path: "high-raw-low-weight", score: 0.99, source: "sessions" }]),
+  ], { k: 60, preferSources: { memory: 2, sessions: 0.5 }, snippetChars: 50, topK: 5 });
+  assert.deepEqual(fused.map((hit) => hit.path), ["low-raw-high-weight", "high-raw-low-weight"]);
+  assert.ok(fused[0].finalRankScore > fused[1].finalRankScore);
+  assert.equal(fused[0].finalScore, fused[0].finalRankScore);
+});
+
+test("quality-tuned defaults stay aligned", () => {
+  const config = readConfig({});
+  assert.equal(config.topK, 3);
+  assert.equal(config.qualityGate.minBestRawScore, 0.65);
+  assert.equal(config.qualityGate.highRawScore, 0.65);
+  assert.equal(config.qualityGate.mediumRawScore, 0.55);
+  assert.equal(config.qualityGate.minRouteHits, 2);
+  assert.equal(config.maxTotalMs, 5000);
+  assert.equal(config.searchTimeoutMs, 2200);
+  assert.equal(config.expansion.timeoutMs, 2500);
+  assert.equal(config.expansion.thinkingMode, "auto");
+  assert.equal(config.semanticGate.timeoutMs, 1800);
+  assert.equal(config.strongSignal.sources.sessions.minScore, 0.92);
+  assert.equal(config.strongSignal.sources.sessions.gap, 0.2);
+  assert.equal(config.rrf.k, 20);
+  assert.equal(config.rrf.rawScoreBlend, 0.5);
+  assert.equal(canonicalPath("memory\\Example.md"), canonicalPath("memory/Example.md"));
+});
+
+test("legacy quality threshold and expansion model remain backward compatible", () => {
+  const config = readConfig({
+    minScore: 0.6,
+    expansion: { model: "cheap-gate-model" },
+    qualityGate: { minBestRawScore: 0.72 },
+  });
+  assert.equal(config.qualityGate.highRawScore, 0.72);
+  assert.equal(config.qualityGate.mediumRawScore, 0.6);
+  assert.equal(config.semanticGate.model, "cheap-gate-model");
+});
+
+test("injection includes a known line anchor and omits all score fields", () => {
+  const fused = fuseRoutes([route("literal", [{ path: "memory/example.md", score: 0.9 }], 2)], {
+    k: 60, preferSources: { memory: 1 }, snippetChars: 100, topK: 5,
+  });
+  fused[0].line = 42;
+  const context = injectContext(fused, 400);
+  assert.match(context ?? "", /memory\/example\.md#L42/);
+  assert.doesNotMatch(context ?? "", /score=/i);
+});

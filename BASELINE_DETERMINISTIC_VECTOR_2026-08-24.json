@@ -1,0 +1,309 @@
+{
+  "schemaVersion": 1,
+  "frozenAt": "2026-08-23T18:44:40.662Z",
+  "source": "memory/recall-traces.jsonl (deterministic/vector freeze window)",
+  "filters": {
+    "since": "2026-08-23T17:58:00.000Z",
+    "until": null,
+    "profile": "balanced",
+    "excludeGraph": true,
+    "requireBalancedLlmInvariant": true
+  },
+  "definitions": {
+    "latency": "totalMs (elapsedMs fallback) across included before_prompt_build traces; nearest-rank percentiles",
+    "triggered": "retrieval ran or the demand gate selected a non-none route; skipped_not_needed and gateDecision=no are excluded",
+    "hit": "a triggered trace with injectedChars > 0",
+    "falsePositive": "a triggered trace whose optional shouldRecall label is false; null when no negative labels exist",
+    "bgeQuery": "search trace entries except graph/profile routes, or explicit bgeQueryCount when present",
+    "quality": "triggered traces only: skipped_strong/high-score injected hits are strong, other injected hits weak, zero injection insufficient",
+    "fallback": "trace has a non-empty fallbackReason; fail_open is reported separately",
+    "queryType": "one deterministic primary category; priority is multi-hop, temporal, preference/history, relationship, project, technical, explicit, plain"
+  },
+  "dataQuality": {
+    "inputRecords": 145,
+    "includedRecords": 4,
+    "invalidJsonlLines": 0,
+    "recordsWithoutRecoverableQuery": 3
+  },
+  "latencyMs": {
+    "count": 4,
+    "min": 4,
+    "p50": 8,
+    "p95": 3025,
+    "p99": 3025,
+    "max": 3025,
+    "mean": 1319
+  },
+  "triggeredLatencyMs": {
+    "count": 2,
+    "min": 2239,
+    "p50": 2239,
+    "p95": 3025,
+    "p99": 3025,
+    "max": 3025,
+    "mean": 2632
+  },
+  "recall": {
+    "triggered": 2,
+    "triggeredRate": 0.5,
+    "hits": 0,
+    "hitRate": 0,
+    "falsePositiveRate": null,
+    "falsePositiveCount": 0,
+    "labeledNegativeCount": 0,
+    "falsePositiveExplanation": "No shouldRecall=false labels are present; false-positive recall rate is intentionally null.",
+    "skippedNotNeeded": 2,
+    "skippedNotNeededRate": 0.5
+  },
+  "injection": {
+    "charsTotal": 0,
+    "charsMeanPerRecord": 0,
+    "charsMeanPerHit": 0,
+    "tokensTotal": 0,
+    "tokensMeanPerRecord": 0,
+    "tokensMeanPerHit": 0
+  },
+  "bgeQueries": {
+    "total": 2,
+    "meanPerRecord": 0.5,
+    "meanPerTriggered": 1
+  },
+  "llmCalls": {
+    "total": 0,
+    "meanPerRecord": 0,
+    "meanPerTriggered": 0
+  },
+  "reliability": {
+    "timeouts": 0,
+    "fallbacks": 0,
+    "failOpen": 1,
+    "balancedInvariantViolations": 0
+  },
+  "quality": {
+    "scope": "triggered",
+    "strong": 0,
+    "weak": 0,
+    "insufficient": 2,
+    "strongRate": 0,
+    "weakRate": 0,
+    "insufficientRate": 1
+  },
+  "byQueryType": {
+    "plain knowledge": {
+      "records": 3,
+      "triggered": 1,
+      "triggeredRate": 0.333333,
+      "hits": 0,
+      "hitRate": 0,
+      "latencyMs": {
+        "count": 3,
+        "min": 4,
+        "p50": 8,
+        "p95": 2239,
+        "p99": 2239,
+        "max": 2239,
+        "mean": 750.333
+      },
+      "injectedChars": 0,
+      "injectedTokens": 0,
+      "bgeQueries": 0,
+      "llmCalls": 0,
+      "timeouts": 0,
+      "fallbacks": 0,
+      "quality": {
+        "strong": 0,
+        "weak": 0,
+        "insufficient": 1
+      }
+    },
+    "explicit recall": {
+      "records": 0,
+      "triggered": 0,
+      "triggeredRate": null,
+      "hits": 0,
+      "hitRate": null,
+      "latencyMs": {
+        "count": 0,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "mean": null
+      },
+      "injectedChars": 0,
+      "injectedTokens": 0,
+      "bgeQueries": 0,
+      "llmCalls": 0,
+      "timeouts": 0,
+      "fallbacks": 0,
+      "quality": {
+        "strong": 0,
+        "weak": 0,
+        "insufficient": 0
+      }
+    },
+    "project recall": {
+      "records": 0,
+      "triggered": 0,
+      "triggeredRate": null,
+      "hits": 0,
+      "hitRate": null,
+      "latencyMs": {
+        "count": 0,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "mean": null
+      },
+      "injectedChars": 0,
+      "injectedTokens": 0,
+      "bgeQueries": 0,
+      "llmCalls": 0,
+      "timeouts": 0,
+      "fallbacks": 0,
+      "quality": {
+        "strong": 0,
+        "weak": 0,
+        "insufficient": 0
+      }
+    },
+    "technical entity recall": {
+      "records": 0,
+      "triggered": 0,
+      "triggeredRate": null,
+      "hits": 0,
+      "hitRate": null,
+      "latencyMs": {
+        "count": 0,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "mean": null
+      },
+      "injectedChars": 0,
+      "injectedTokens": 0,
+      "bgeQueries": 0,
+      "llmCalls": 0,
+      "timeouts": 0,
+      "fallbacks": 0,
+      "quality": {
+        "strong": 0,
+        "weak": 0,
+        "insufficient": 0
+      }
+    },
+    "temporal recall": {
+      "records": 0,
+      "triggered": 0,
+      "triggeredRate": null,
+      "hits": 0,
+      "hitRate": null,
+      "latencyMs": {
+        "count": 0,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "mean": null
+      },
+      "injectedChars": 0,
+      "injectedTokens": 0,
+      "bgeQueries": 0,
+      "llmCalls": 0,
+      "timeouts": 0,
+      "fallbacks": 0,
+      "quality": {
+        "strong": 0,
+        "weak": 0,
+        "insufficient": 0
+      }
+    },
+    "relationship recall": {
+      "records": 1,
+      "triggered": 1,
+      "triggeredRate": 1,
+      "hits": 0,
+      "hitRate": 0,
+      "latencyMs": {
+        "count": 1,
+        "min": 3025,
+        "p50": 3025,
+        "p95": 3025,
+        "p99": 3025,
+        "max": 3025,
+        "mean": 3025
+      },
+      "injectedChars": 0,
+      "injectedTokens": 0,
+      "bgeQueries": 2,
+      "llmCalls": 0,
+      "timeouts": 0,
+      "fallbacks": 0,
+      "quality": {
+        "strong": 0,
+        "weak": 0,
+        "insufficient": 1
+      }
+    },
+    "multi-hop recall": {
+      "records": 0,
+      "triggered": 0,
+      "triggeredRate": null,
+      "hits": 0,
+      "hitRate": null,
+      "latencyMs": {
+        "count": 0,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "mean": null
+      },
+      "injectedChars": 0,
+      "injectedTokens": 0,
+      "bgeQueries": 0,
+      "llmCalls": 0,
+      "timeouts": 0,
+      "fallbacks": 0,
+      "quality": {
+        "strong": 0,
+        "weak": 0,
+        "insufficient": 0
+      }
+    },
+    "preference/history recall": {
+      "records": 0,
+      "triggered": 0,
+      "triggeredRate": null,
+      "hits": 0,
+      "hitRate": null,
+      "latencyMs": {
+        "count": 0,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "mean": null
+      },
+      "injectedChars": 0,
+      "injectedTokens": 0,
+      "bgeQueries": 0,
+      "llmCalls": 0,
+      "timeouts": 0,
+      "fallbacks": 0,
+      "quality": {
+        "strong": 0,
+        "weak": 0,
+        "insufficient": 0
+      }
+    }
+  }
+}

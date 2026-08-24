@@ -5,6 +5,7 @@ export type StructuredOutputMode = "json_object" | "json_schema";
 export type ThinkingMode = "auto" | "enabled" | "disabled" | "omit";
 export type GraphMemoryProvider = "local-sqlite" | "graphiti" | "falkordb" | "neo4j";
 export type GraphRouteMode = "auto" | "vector" | "graph" | "hybrid";
+export type GraphWriterMode = "off" | "dry-run" | "shadow" | "write";
 
 export interface RecallTriggerConfig {
   mode: RecallTriggerMode;
@@ -19,6 +20,7 @@ export interface ExpansionConfig {
   model: string;
   headers: Record<string, string>;
   timeoutMs: number;
+  minRemainingBudgetMs: number;
   maxOutputTokens: number;
   responseFormat: StructuredOutputMode;
   thinkingMode: ThinkingMode;
@@ -53,11 +55,20 @@ export interface GraphMemoryConfig {
   graphBudget: number;
   writer: {
     enabled: boolean;
+    mode: GraphWriterMode;
     model: string;
     timeoutMs: number;
     maxOutputTokens: number;
     maxInputChars: number;
     traceFile: string;
+    sessionAllowlist: string[];
+    maxEntitiesPerTurn: number;
+    maxEdgesPerTurn: number;
+    maxEpisodesPerTurn: number;
+    circuitBreaker: {
+      failureThreshold: number;
+      resetAfterMs: number;
+    };
   };
 }
 
@@ -143,6 +154,12 @@ function graphRouteModeValue(value: unknown): GraphRouteMode {
   return value === "vector" || value === "graph" || value === "hybrid" ? value : "auto";
 }
 
+function graphWriterModeValue(value: unknown, fallback: GraphWriterMode): GraphWriterMode {
+  return value === "off" || value === "dry-run" || value === "shadow" || value === "write"
+    ? value
+    : fallback;
+}
+
 function stringArray(value: unknown, fallback: string[]): string[] {
   if (!Array.isArray(value)) return [...fallback];
   const output = value
@@ -180,6 +197,7 @@ export function readConfig(pluginConfig: unknown): RecallConfig {
   const semanticGate = record(raw.semanticGate);
   const graphMemory = record(raw.graphMemory);
   const graphWriter = record(graphMemory.writer);
+  const graphWriterCircuitBreaker = record(graphWriter.circuitBreaker);
   const rrf = record(raw.rrf);
   const trace = record(raw.trace);
 
@@ -204,7 +222,8 @@ export function readConfig(pluginConfig: unknown): RecallConfig {
       apiKeyEnv: stringValue(expansion.apiKeyEnv, "DEEPSEEK_API_KEY"),
       model: stringValue(expansion.model, "deepseek-v4-flash"),
       headers: stringMap(expansion.headers),
-      timeoutMs: numberValue(expansion.timeoutMs, 2500),
+      timeoutMs: Math.min(2500, numberValue(expansion.timeoutMs, 2500)),
+      minRemainingBudgetMs: numberValue(expansion.minRemainingBudgetMs, 2750),
       maxOutputTokens: numberValue(expansion.maxOutputTokens, 800),
       responseFormat: structuredOutputModeValue(expansion.responseFormat),
       thinkingMode: thinkingModeValue(expansion.thinkingMode),
@@ -214,7 +233,7 @@ export function readConfig(pluginConfig: unknown): RecallConfig {
       },
     },
     semanticGate: {
-      enabled: booleanValue(semanticGate.enabled, true),
+      enabled: booleanValue(semanticGate.enabled, false),
       model: stringValue(semanticGate.model, stringValue(expansion.model, "deepseek-v4-flash")),
       timeoutMs: numberValue(semanticGate.timeoutMs, 1800),
       maxOutputTokens: numberValue(semanticGate.maxOutputTokens, 160),
@@ -235,11 +254,23 @@ export function readConfig(pluginConfig: unknown): RecallConfig {
       graphBudget: numberValue(graphMemory.graphBudget, 300),
       writer: {
         enabled: booleanValue(graphWriter.enabled, true),
+        mode: graphWriterModeValue(
+          graphWriter.mode,
+          booleanValue(graphWriter.enabled, true) && booleanValue(graphMemory.enabled, false) ? "write" : "off",
+        ),
         model: stringValue(graphWriter.model, stringValue(expansion.model, "deepseek-v4-flash")),
         timeoutMs: numberValue(graphWriter.timeoutMs, 8000),
         maxOutputTokens: numberValue(graphWriter.maxOutputTokens, 1200),
         maxInputChars: numberValue(graphWriter.maxInputChars, 12000),
         traceFile: stringValue(graphWriter.traceFile, "memory/graph-memory/write-traces.jsonl"),
+        sessionAllowlist: stringArray(graphWriter.sessionAllowlist, []),
+        maxEntitiesPerTurn: Math.max(1, Math.round(numberValue(graphWriter.maxEntitiesPerTurn, 12))),
+        maxEdgesPerTurn: Math.max(0, Math.round(numberValue(graphWriter.maxEdgesPerTurn, 16))),
+        maxEpisodesPerTurn: Math.max(0, Math.min(1, Math.round(numberValue(graphWriter.maxEpisodesPerTurn, 1)))),
+        circuitBreaker: {
+          failureThreshold: Math.max(1, Math.round(numberValue(graphWriterCircuitBreaker.failureThreshold, 3))),
+          resetAfterMs: Math.max(1000, Math.round(numberValue(graphWriterCircuitBreaker.resetAfterMs, 300000))),
+        },
       },
     },
     strongSignal: (() => {

@@ -1,5 +1,5 @@
 import type { ExpansionConfig } from "./config.js";
-import { parseJsonCandidates, structuredResponseFormat } from "./structured-output.js";
+import { messageTextContent, parseJsonCandidates, structuredResponseFormat, thinkingRequestField } from "./structured-output.js";
 import type { JsonParseMode } from "./structured-output.js";
 
 export interface Association {
@@ -45,6 +45,8 @@ export interface ExpansionDiagnostics {
   failureReason?: ExpansionFailureReason;
   finishReason?: string;
   httpStatus?: number;
+  contentType?: string;
+  hasReasoningContent?: boolean;
 }
 
 export interface ExpansionAttempt {
@@ -179,6 +181,7 @@ export async function expandQuery(
         messages: [{ role: "user", content: expansionPrompt(message, maxAssociations) }],
         max_tokens: config.maxOutputTokens,
         response_format: structuredResponseFormat(config.responseFormat, "active_recall_expansion", expansionSchema),
+        ...thinkingRequestField(config.endpoint, config.thinkingMode),
       }),
     });
     if (!response.ok) {
@@ -188,31 +191,35 @@ export async function expandQuery(
         diagnostics: { ...emptyDiagnostics, failureReason: "http_fail", httpStatus: response.status },
       };
     }
-    let payload: { choices?: Array<{ finish_reason?: unknown; message?: { content?: unknown } }> };
+    let payload: { choices?: Array<{ finish_reason?: unknown; message?: { content?: unknown; reasoning_content?: unknown } }> };
     try {
       payload = await response.json() as typeof payload;
     } catch {
       return { result: null, status: "payload_fail", diagnostics: { ...emptyDiagnostics, failureReason: "payload_fail" } };
     }
     const choice = payload.choices?.[0];
-    const content = choice?.message?.content;
+    const extracted = messageTextContent(choice?.message?.content);
     const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : undefined;
-    if (typeof content !== "string") {
+    const hasReasoningContent = typeof choice?.message?.reasoning_content === "string"
+      && choice.message.reasoning_content.trim().length > 0;
+    const responseDiagnostics = { finishReason, contentType: extracted.contentType, hasReasoningContent };
+    if (extracted.text === null) {
       return {
         result: null,
         status: "payload_fail",
-        diagnostics: { ...emptyDiagnostics, failureReason: "payload_fail", finishReason },
+        diagnostics: { ...emptyDiagnostics, failureReason: "payload_fail", ...responseDiagnostics },
       };
     }
+    const content = extracted.text;
     if (!content.trim()) {
       return {
         result: null,
         status: "parse_fail",
-        diagnostics: { parseMode: "none", contentChars: 0, failureReason: "empty_content", finishReason },
+        diagnostics: { parseMode: "none", contentChars: 0, failureReason: "empty_content", ...responseDiagnostics },
       };
     }
     const parsed = parseExpansionContent(content, maxAssociations);
-    const diagnostics: ExpansionDiagnostics = { ...parsed.diagnostics, finishReason };
+    const diagnostics: ExpansionDiagnostics = { ...parsed.diagnostics, ...responseDiagnostics };
     if (!parsed.result && finishReason === "length") diagnostics.failureReason = "truncated";
     return { result: parsed.result, status: parsed.status, diagnostics };
   } catch (error) {

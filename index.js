@@ -1,16 +1,15 @@
 import { cleanPromptForSearch, isSystemEventPrompt } from "./clean-prompt.js";
 import { depthForProfile, maxAssociationsForDepth, maxResultsForDepth, readConfig } from "./config.js";
 import { evaluateRecallDemand } from "./demand.js";
+import { buildDeterministicSearchRoutes, normalizeRecallQuery, queryKey } from "./deterministic-expansion.js";
 import { buildExpansionSearchRoutes, expandQuery } from "./expansion.js";
 import { fuseRoutes, isStrongSignal, successfulRoutes } from "./fusion.js";
 import { createGraphProvider } from "./graph-provider.js";
-import { enqueueMemoryWrite } from "./memory-writer.js";
+import { effectiveWriterMode, enqueueMemoryWrite } from "./memory-writer.js";
 import { ProfileMemoryStore } from "./profile-memory.js";
-import { evaluateSemanticRecall } from "./semantic-gate.js";
 import { isInternalSession } from "./session-guard.js";
 import { memorySearch } from "./search.js";
 import { writeTrace } from "./trace.js";
-
 
 
 
@@ -172,7 +171,6 @@ function queueTrace(api           , trace             , config              , ct
 
 
 
-
 async function defaultGraphSearch(query        , config              , ctx           )                        {
   const provider = createGraphProvider(config.graphMemory.provider, config.graphMemory.file, ctx.workspaceDir);
   try {
@@ -203,7 +201,6 @@ async function runRecall(
   const dependencies                     = {
     search: dependencyOverrides.search ?? memorySearch,
     expand: dependencyOverrides.expand ?? expandQuery,
-    semanticGate: dependencyOverrides.semanticGate ?? evaluateSemanticRecall,
     graphSearch: dependencyOverrides.graphSearch ?? defaultGraphSearch,
     profileSearch: dependencyOverrides.profileSearch ?? defaultProfileSearch,
   };
@@ -218,7 +215,7 @@ async function runRecall(
   const demand = evaluateRecallDemand(cleaned, config.trigger);
   let routeDecision = resolveRecallRoute(demand.route, config);
   let depth              = demand.depth ?? depthForProfile(config.profile);
-  let gateStatus                                 = "not_run";
+  let gateStatus                                         = "not_run";
   let gateReason = demand.reason;
   let gateFinishReason                    ;
   let gateContentType                    ;
@@ -234,6 +231,13 @@ async function runRecall(
   let vectorHits = 0;
   let graphHits = 0;
   let profileHits = 0;
+  let probeTopScore                    ;
+  let probePassed                     ;
+  let probeLiteral                          ;
+  let deterministicQueries = 0;
+  let llmCalls = 0;
+  let rescueStatus                                           = "not_run";
+  let rescueRemainingMs                    ;
 
   const inject = ()       => {
     const injected = buildInjectedContext(fused, config.injectTokenBudget, {
@@ -260,6 +264,9 @@ async function runRecall(
       routeDecision, fallbackReason, graphTimedOut, vectorHits, graphHits, profileHits,
       gateDecision: demand.decision, gateStatus, gateReason,
       gateFinishReason, gateContentType, gateHasReasoningContent,
+      probeTopScore, probePassed, deterministicQueries, llmCalls,
+      balancedLlmInvariant: depth !== "balanced" || llmCalls === 0,
+      rescueStatus, rescueRemainingMs,
       expansion: expansionStatus, searches: traceSearches,
       expansionParseMode: expansionDiagnostics?.parseMode,
       expansionFinishReason: expansionDiagnostics?.finishReason,
@@ -290,33 +297,42 @@ async function runRecall(
     return undefined;
   }
 
+  // Route selection has already consumed the original temporal cues. Only retrieval normalization may remove them.
+  const searchQuery = normalizeRecallQuery(demand.query);
+
   if (demand.decision === "uncertain") {
     const gateStartedAt = performance.now();
-    let gateAttempt                                                    ;
     try {
-      gateAttempt = await dependencies.semanticGate(cleaned, config.expansion, {
-        ...config.semanticGate,
-        timeoutMs: boundedTimeout(config.semanticGate.timeoutMs, remainingMs(startedAt, config.maxTotalMs)),
+      const probe = await dependencies.search(searchQuery, {
+        agent,
+        maxResults: 1,
+        minScore: config.minScore,
+        timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
       });
-    } catch {
-      gateAttempt = { result: null, status: "request_fail", parseMode: "none" };
+      probeLiteral = probe;
+      vectorHits += probe.hits.length;
+      probeTopScore = probe.hits[0]?.score;
+      probePassed = fuseForRecall([{ route: "probe", weight: config.rrf.originalWeight, result: probe }], config).length > 0;
+      gateStatus = probePassed ? "bge_probe_pass" : "bge_probe_fail";
+      gateReason = probePassed ? "bge_probe_quality_pass" : "bge_probe_quality_fail";
+      traceSearches.push({ route: "probe", query: searchQuery, hits: probe.hits.length, ...probe.timing });
+    } catch (error) {
+      gateStatus = "bge_probe_error";
+      gateReason = "bge_probe_error";
+      fallbackReason = `probe:${error instanceof Error ? error.message : String(error)}`;
+      probePassed = false;
     }
     metrics.gateMs = Math.round(performance.now() - gateStartedAt);
-    gateStatus = gateAttempt.status;
-    gateReason = gateAttempt.result?.reason ?? demand.reason;
-    gateFinishReason = gateAttempt.finishReason;
-    gateContentType = gateAttempt.contentType;
-    gateHasReasoningContent = gateAttempt.hasReasoningContent;
-    if (!gateAttempt.result?.recall) {
+    metrics.literalMs = metrics.gateMs;
+    metrics.searchMs += metrics.gateMs;
+    if (!probePassed) {
       depth = "none";
       routeDecision = "none";
-      emitTrace("skipped_semantic_no");
+      emitTrace("skipped_probe_no");
       return undefined;
     }
-    depth = gateAttempt.result.depth;
   }
 
-  const searchQuery = demand.query;
   const auxiliaryRoutes                = [];
   if (config.graphMemory.enabled) {
     const profileStartedAt = performance.now();
@@ -335,9 +351,9 @@ async function runRecall(
   if (routeDecision === "graph" || routeDecision === "hybrid") {
     const graphStartedAt = performance.now();
     try {
-      const graph = await withTimeout(dependencies.graphSearch(searchQuery, config, ctx), config.graphMemory.readTimeoutMs, "graph memory read");
+      const graph = await withTimeout(dependencies.graphSearch(demand.query, config, ctx), config.graphMemory.readTimeoutMs, "graph memory read");
       graphHits = graph.hits.length;
-      traceSearches.push({ route: "graph", query: searchQuery, hits: graph.hits.length, ...graph.timing });
+      traceSearches.push({ route: "graph", query: demand.query, hits: graph.hits.length, ...graph.timing });
       if (graph.hits.length > 0) auxiliaryRoutes.push({ route: "graph", weight: 1.6, result: graph });
     } catch (error) {
       graphFailed = true;
@@ -360,20 +376,22 @@ async function runRecall(
   let status               = graphFailed || (demand.route === "hybrid" && graphHits === 0) ? "partial" : "fail_open";
   try {
     const vectorStartedAt = performance.now();
-    const literalStartedAt = performance.now();
-    const literal = await dependencies.search(searchQuery, {
-      agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore,
-      timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
-    });
-    metrics.literalMs = Math.round(performance.now() - literalStartedAt);
-    metrics.searchMs += metrics.literalMs;
-    vectorHits += literal.hits.length;
-    traceSearches.push({ route: "literal", query: searchQuery, hits: literal.hits.length, ...literal.timing });
+    let literal = probeLiteral;
+    if (!literal) {
+      const literalStartedAt = performance.now();
+      literal = await dependencies.search(searchQuery, {
+        agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore,
+        timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
+      });
+      metrics.literalMs = Math.round(performance.now() - literalStartedAt);
+      metrics.searchMs += metrics.literalMs;
+      vectorHits += literal.hits.length;
+      traceSearches.push({ route: "literal", query: searchQuery, hits: literal.hits.length, ...literal.timing });
+    }
     const literalRoute              = { route: "literal", weight: config.rrf.originalWeight, result: literal };
     const strong = isStrongSignal(literal.hits, config.strongSignal);
 
-    const fuseLiteral = (partial         )       => {
-      const routes = [literalRoute, ...auxiliaryRoutes];
+    const fuseAndInject = (routes               , partial         )       => {
       const fusionStartedAt = performance.now();
       fused = fuseForRecall(routes, config);
       metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
@@ -383,56 +401,90 @@ async function runRecall(
 
     if (strong || depth === "literal") {
       expansionStatus = strong ? "skipped_strong" : config.profile === "speed" ? "skipped_speed" : "skipped_literal";
-      fuseLiteral(false);
+      rescueStatus = "skipped_quality";
+      fuseAndInject([literalRoute, ...auxiliaryRoutes], false);
     } else {
-      const expansionStartedAt = performance.now();
-      let expansion                                         ;
-      try {
-        expansion = await dependencies.expand(searchQuery, {
-          ...config.expansion,
-          timeoutMs: boundedTimeout(config.expansion.timeoutMs, remainingMs(startedAt, config.maxTotalMs)),
-        }, maxAssociationsForDepth(config, depth));
-      } catch {
-        expansion = {
-          result: null,
-          status: "request_fail",
-          diagnostics: { parseMode: "none", contentChars: 0, failureReason: "request_fail" },
-        };
-      }
-      metrics.expansionMs = Math.round(performance.now() - expansionStartedAt);
-      expansionStatus = expansion.status;
-      expansionDiagnostics = expansion.diagnostics;
-      if (!expansion.result) {
-        fuseLiteral(true);
+      const deterministic = buildDeterministicSearchRoutes(
+        demand.query,
+        depth,
+        maxAssociationsForDepth(config, depth),
+      );
+      deterministicQueries = deterministic.length;
+      const deterministicSearchStartedAt = performance.now();
+      const routeBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
+      const settled = await Promise.allSettled(deterministic.map(async (route)                       => {
+        const result = await dependencies.search(route.query, {
+          agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore, timeoutMs: routeBudget,
+        });
+        vectorHits += result.hits.length;
+        traceSearches.push({ route: route.route, query: route.query, hits: result.hits.length, ...result.timing });
+        return { route: route.route, weight: route.weight, result };
+      }));
+      metrics.searchMs += Math.round(performance.now() - deterministicSearchStartedAt);
+      let successful = [literalRoute, ...successfulRoutes(settled), ...auxiliaryRoutes];
+      fuseAndInject(successful, settled.some((item) => item.status === "rejected"));
+      status = fused.length > 0
+        ? statusForFailures(deterministic.length + 1 + auxiliaryRoutes.length, successful.length, true, remainingMs(startedAt, config.maxTotalMs) === 0)
+        : emptyFusionStatus(successful);
+      if (graphFailed && fused.length > 0) status = "partial";
+
+      if (fused.length > 0) {
+        rescueStatus = "skipped_quality";
+      } else if (depth !== "deep") {
+        rescueStatus = "skipped_not_deep";
+      } else if (demand.reason !== "explicit_prefix" && demand.reason !== "memory_intent") {
+        rescueStatus = "skipped_intent";
       } else {
-        const routes = buildExpansionSearchRoutes(searchQuery, expansion.result);
-        if (routes.length === 0) {
-          fuseLiteral(true);
+        rescueRemainingMs = remainingMs(startedAt, config.maxTotalMs);
+        const requiredRescueBudget = Math.max(config.expansion.minRemainingBudgetMs, config.expansion.timeoutMs);
+        if (rescueRemainingMs < requiredRescueBudget) {
+          rescueStatus = "skipped_budget";
         } else {
-          const expandedSearchStartedAt = performance.now();
-          const routeBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
-          const settled = await Promise.allSettled(routes.map(async (route)                       => {
-            const result = await dependencies.search(route.query, {
-              agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore, timeoutMs: routeBudget,
-            });
-            vectorHits += result.hits.length;
-            traceSearches.push({ route: route.route, query: route.query, hits: result.hits.length, ...result.timing });
-            return { route: route.route, weight: route.weight, result };
-          }));
-          metrics.searchMs += Math.round(performance.now() - expandedSearchStartedAt);
-          const successful = [literalRoute, ...successfulRoutes(settled), ...auxiliaryRoutes];
-          const fusionStartedAt = performance.now();
-          fused = fuseForRecall(successful, config);
-          metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
-          inject();
-          status = fused.length > 0
-            ? statusForFailures(routes.length + 1 + auxiliaryRoutes.length, successful.length, true, remainingMs(startedAt, config.maxTotalMs) === 0)
-            : emptyFusionStatus(successful);
-          if (graphFailed && fused.length > 0) status = "partial";
+          const expansionStartedAt = performance.now();
+          let expansion                                         ;
+          llmCalls += 1;
+          try {
+            expansion = await dependencies.expand(searchQuery, {
+              ...config.expansion,
+              timeoutMs: Math.min(2500, boundedTimeout(config.expansion.timeoutMs, rescueRemainingMs)),
+            }, maxAssociationsForDepth(config, depth));
+          } catch {
+            expansion = {
+              result: null,
+              status: "request_fail",
+              diagnostics: { parseMode: "none", contentChars: 0, failureReason: "request_fail" },
+            };
+          }
+          metrics.expansionMs = Math.round(performance.now() - expansionStartedAt);
+          expansionStatus = expansion.status;
+          expansionDiagnostics = expansion.diagnostics;
+          rescueStatus = expansion.status;
+          if (expansion.result) {
+            const seenQueries = new Set([queryKey(searchQuery), ...deterministic.map((route) => queryKey(route.query))]);
+            const rescueRoutes = buildExpansionSearchRoutes(searchQuery, expansion.result)
+              .filter((route) => !seenQueries.has(queryKey(route.query)));
+            const rescueSearchStartedAt = performance.now();
+            const rescueBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
+            const rescueSettled = await Promise.allSettled(rescueRoutes.map(async (route)                       => {
+              const result = await dependencies.search(route.query, {
+                agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore, timeoutMs: rescueBudget,
+              });
+              vectorHits += result.hits.length;
+              traceSearches.push({ route: `rescue:${route.route}`, query: route.query, hits: result.hits.length, ...result.timing });
+              return { route: `rescue:${route.route}`, weight: route.weight, result };
+            }));
+            metrics.searchMs += Math.round(performance.now() - rescueSearchStartedAt);
+            successful = [...successful, ...successfulRoutes(rescueSettled)];
+            fuseAndInject(successful, rescueSettled.some((item) => item.status === "rejected"));
+            status = fused.length > 0
+              ? statusForFailures(deterministic.length + rescueRoutes.length + 1 + auxiliaryRoutes.length, successful.length, true, remainingMs(startedAt, config.maxTotalMs) === 0)
+              : emptyFusionStatus(successful);
+            if (graphFailed && fused.length > 0) status = "partial";
+          }
         }
       }
     }
-    metrics.vectorMs = Math.round(performance.now() - vectorStartedAt);
+    metrics.vectorMs = Math.round(performance.now() - vectorStartedAt) + (probeLiteral ? metrics.gateMs : 0);
   } catch (error) {
     api.logger?.error?.(`active-recall vector fail-open: ${error instanceof Error ? error.message : String(error)}`);
     if (auxiliaryRoutes.length > 0) {
@@ -455,7 +507,7 @@ const plugin = {
     const config = readConfig(api.pluginConfig);
     if (!config.enabled) return;
     api.on("before_prompt_build", (event, ctx) => runRecall(api, event, ctx             , config), { priority: 10 });
-    if (config.graphMemory.enabled && config.graphMemory.writer.enabled) {
+    if (effectiveWriterMode(config) !== "off") {
       api.on("agent_end", (event, ctx) => {
         enqueueMemoryWrite(api, event, ctx, config);
       }, { timeoutMs: 1000 });

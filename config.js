@@ -95,6 +95,17 @@
 
 
 
+
+
+
+
+
+
+
+
+
+
+
 const profileBudgets                                = {
   speed: 400,
   balanced: 800,
@@ -143,6 +154,12 @@ function graphRouteModeValue(value         )                 {
   return value === "vector" || value === "graph" || value === "hybrid" ? value : "auto";
 }
 
+function graphWriterModeValue(value         , fallback                 )                  {
+  return value === "off" || value === "dry-run" || value === "shadow" || value === "write"
+    ? value
+    : fallback;
+}
+
 function stringArray(value         , fallback          )           {
   if (!Array.isArray(value)) return [...fallback];
   const output = value
@@ -180,6 +197,7 @@ export function readConfig(pluginConfig         )               {
   const semanticGate = record(raw.semanticGate);
   const graphMemory = record(raw.graphMemory);
   const graphWriter = record(graphMemory.writer);
+  const graphWriterCircuitBreaker = record(graphWriter.circuitBreaker);
   const rrf = record(raw.rrf);
   const trace = record(raw.trace);
 
@@ -204,7 +222,8 @@ export function readConfig(pluginConfig         )               {
       apiKeyEnv: stringValue(expansion.apiKeyEnv, "DEEPSEEK_API_KEY"),
       model: stringValue(expansion.model, "deepseek-v4-flash"),
       headers: stringMap(expansion.headers),
-      timeoutMs: numberValue(expansion.timeoutMs, 2500),
+      timeoutMs: Math.min(2500, numberValue(expansion.timeoutMs, 2500)),
+      minRemainingBudgetMs: numberValue(expansion.minRemainingBudgetMs, 2750),
       maxOutputTokens: numberValue(expansion.maxOutputTokens, 800),
       responseFormat: structuredOutputModeValue(expansion.responseFormat),
       thinkingMode: thinkingModeValue(expansion.thinkingMode),
@@ -214,7 +233,7 @@ export function readConfig(pluginConfig         )               {
       },
     },
     semanticGate: {
-      enabled: booleanValue(semanticGate.enabled, true),
+      enabled: booleanValue(semanticGate.enabled, false),
       model: stringValue(semanticGate.model, stringValue(expansion.model, "deepseek-v4-flash")),
       timeoutMs: numberValue(semanticGate.timeoutMs, 1800),
       maxOutputTokens: numberValue(semanticGate.maxOutputTokens, 160),
@@ -235,11 +254,23 @@ export function readConfig(pluginConfig         )               {
       graphBudget: numberValue(graphMemory.graphBudget, 300),
       writer: {
         enabled: booleanValue(graphWriter.enabled, true),
+        mode: graphWriterModeValue(
+          graphWriter.mode,
+          booleanValue(graphWriter.enabled, true) && booleanValue(graphMemory.enabled, false) ? "write" : "off",
+        ),
         model: stringValue(graphWriter.model, stringValue(expansion.model, "deepseek-v4-flash")),
         timeoutMs: numberValue(graphWriter.timeoutMs, 8000),
         maxOutputTokens: numberValue(graphWriter.maxOutputTokens, 1200),
         maxInputChars: numberValue(graphWriter.maxInputChars, 12000),
         traceFile: stringValue(graphWriter.traceFile, "memory/graph-memory/write-traces.jsonl"),
+        sessionAllowlist: stringArray(graphWriter.sessionAllowlist, []),
+        maxEntitiesPerTurn: Math.max(1, Math.round(numberValue(graphWriter.maxEntitiesPerTurn, 12))),
+        maxEdgesPerTurn: Math.max(0, Math.round(numberValue(graphWriter.maxEdgesPerTurn, 16))),
+        maxEpisodesPerTurn: Math.max(0, Math.min(1, Math.round(numberValue(graphWriter.maxEpisodesPerTurn, 1)))),
+        circuitBreaker: {
+          failureThreshold: Math.max(1, Math.round(numberValue(graphWriterCircuitBreaker.failureThreshold, 3))),
+          resetAfterMs: Math.max(1000, Math.round(numberValue(graphWriterCircuitBreaker.resetAfterMs, 300000))),
+        },
       },
     },
     strongSignal: (() => {

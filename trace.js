@@ -63,6 +63,13 @@ import { join } from "node:path";
 
 
 
+
+
+
+
+
+
+
 export async function writeTrace(trace             , file        , workspaceDir         )                {
   const target = isAbsolute(file) ? file : resolve(workspaceDir ?? join(homedir(), ".openclaw", "workspace"), file);
   await mkdir(dirname(target), { recursive: true });

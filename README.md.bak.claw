@@ -1,5 +1,7 @@
 # Active Recall
 
+> v0.5.0 adds an optional, default-off Profile + Vector + Temporal Graph Memory path. See [GRAPH_MEMORY_V1.md](./GRAPH_MEMORY_V1.md) for architecture, configuration, rollout, and rollback.
+
 一个不占 memory slot 的 **OpenClaw 薄插件**：先用零 LLM 成本的三级规则门控判断当前消息是否依赖历史记忆；只有规则结果为 `uncertain` 时才调用一次短超时 semantic gate。确认需要记忆后，在 `before_prompt_build` 阶段 literal-first 检索，必要时再做「结构化 query expansion + 多路检索 RRF 融合」，把本地记忆（memory-core / BGE-M3 + BM25）里相关的背景注入到 prompt 上下文。
 
 > 定位：**薄插件**，复用现有 memory-core 后端，不自建索引、不抢 memory slot。默认是**按需召回**：普通独立问题直接跳过；明确回忆、跨会话延续、历史偏好或「那个项目现在怎样」这类依赖旧上下文的问题才检索、融合、注入。

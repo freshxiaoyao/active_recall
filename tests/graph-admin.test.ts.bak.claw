@@ -1,0 +1,272 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { GraphAdmin, parseVectorEpisodeMarkdown } from "../graph-admin.js";
+import { SqliteGraphProvider } from "../graph-provider.js";
+import type { GraphEpisodeInput } from "../graph-types.js";
+
+function episode(id: string, sessionKey: string, occurredAt: string, project = "human-gate"): GraphEpisodeInput {
+  return {
+    id,
+    sessionKey,
+    runId: `run-${id}`,
+    occurredAt,
+    source: "graph-admin-test",
+    sourcePath: `memory/graph-memory/episodes/${id}.md`,
+    summary: `${project} is maintained with Codex`,
+    entities: [
+      { name: project, type: "Project", aliases: project === "human-gate" ? ["Human Gate", "hg"] : [] },
+      { name: "Codex", type: "Tool" },
+    ],
+    relations: [{ from: project, type: "maintained_with", to: "Codex", confidence: 0.95 }],
+  };
+}
+
+function guard(admin: GraphAdmin, operation: string, target: string) {
+  return { expectedDatabasePath: admin.file, confirmationToken: admin.mutationToken(operation, target) };
+}
+
+test("admin exports and inspects entity provenance without mutating the graph", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-admin-inspect-"));
+  const file = join(temp, "graph.sqlite");
+  const provider = new SqliteGraphProvider(file);
+  const admin = new GraphAdmin(file);
+  try {
+    await provider.ingestEpisode(episode("ep-one", "agent:main:session-one", "2026-08-01T00:00:00.000Z"));
+    provider.close();
+    const snapshot = await admin.exportGraph();
+    assert.equal(snapshot.tables.episodes?.length, 1);
+    assert.equal(snapshot.tables.edges?.length, 1);
+    const inspection = await admin.inspectEntity("hg");
+    assert.equal(inspection.matches.length, 1);
+    assert.ok(inspection.matches[0].aliases.includes("hg"));
+    assert.ok(inspection.matches[0].aliases.some((alias) => alias === "Human Gate" || alias === "human-gate"));
+    assert.equal(inspection.matches[0].outgoingEdges.length, 1);
+    assert.equal(inspection.matches[0].outgoingEdges[0].valid_to, null);
+    assert.equal(inspection.matches[0].sourceEpisodes[0].id, "ep-one");
+  } finally {
+    provider.close();
+    admin.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("destructive mutations require exact database path and operation token", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-admin-guard-"));
+  const file = join(temp, "graph.sqlite");
+  const provider = new SqliteGraphProvider(file);
+  const admin = new GraphAdmin(file);
+  try {
+    await provider.ingestEpisode(episode("ep-guard", "agent:main:guard", "2026-08-01T00:00:00.000Z"));
+    provider.close();
+    await assert.rejects(
+      admin.deleteByEpisode("ep-guard", { expectedDatabasePath: file, confirmationToken: "wrong" }),
+      /confirmation token mismatch/,
+    );
+    assert.equal((await admin.exportGraph()).tables.episodes?.length, 1);
+    await assert.rejects(
+      admin.deleteByEpisode("ep-guard", { expectedDatabasePath: join(temp, "other.sqlite"), confirmationToken: admin.mutationToken("delete-episode", "ep-guard") }),
+      /expected-db/,
+    );
+    const result = await admin.deleteByEpisode("ep-guard", guard(admin, "delete-episode", "ep-guard"));
+    assert.equal(result.episodesAffected, 1);
+    await access(result.backupFile);
+    assert.equal((await admin.exportGraph()).tables.episodes?.length, 0);
+  } finally {
+    provider.close();
+    admin.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("delete-by-session is scoped and exported JSON can restore the graph", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-admin-restore-"));
+  const file = join(temp, "graph.sqlite");
+  const provider = new SqliteGraphProvider(file);
+  const admin = new GraphAdmin(file);
+  try {
+    await provider.ingestEpisode(episode("ep-a", "agent:main:a", "2026-08-01T00:00:00.000Z"));
+    await provider.ingestEpisode(episode("ep-b", "agent:main:b", "2026-08-02T00:00:00.000Z", "project-b"));
+    provider.close();
+    const before = await admin.exportGraph();
+    const deleted = await admin.deleteBySession("agent:main:a", guard(admin, "delete-session", "agent:main:a"));
+    assert.equal(deleted.episodesAffected, 1);
+    assert.equal(deleted.orphanPruneSkipped, false);
+    assert.ok(deleted.entitiesAffected >= 1);
+    assert.deepEqual((await admin.exportGraph()).tables.episodes?.map((row) => row.id), ["ep-b"]);
+    assert.equal((await admin.inspectEntity("human-gate")).matches.length, 0);
+    const restored = await admin.importGraph(before, guard(admin, "import", "snapshot"));
+    assert.equal(restored.episodesAffected, 2);
+    assert.deepEqual(new Set((await admin.exportGraph()).tables.episodes?.map((row) => row.id)), new Set(["ep-a", "ep-b"]));
+  } finally {
+    provider.close();
+    admin.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("delete-by-time is inclusive and clear removes every graph table row", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-admin-time-clear-"));
+  const file = join(temp, "graph.sqlite");
+  const provider = new SqliteGraphProvider(file);
+  const admin = new GraphAdmin(file);
+  const from = "2026-08-01T00:00:00.000Z";
+  const to = "2026-08-01T23:59:59.999Z";
+  try {
+    await provider.ingestEpisode(episode("ep-day-one", "agent:main:time", from));
+    await provider.ingestEpisode(episode("ep-day-two", "agent:main:time", "2026-08-02T00:00:00.000Z", "project-two"));
+    provider.close();
+    const target = `${from}..${to}`;
+    const deleted = await admin.deleteByTimeRange(from, to, guard(admin, "delete-time", target));
+    assert.equal(deleted.episodesAffected, 1);
+    assert.deepEqual((await admin.exportGraph()).tables.episodes?.map((row) => row.id), ["ep-day-two"]);
+    const cleared = await admin.clearGraph(guard(admin, "clear", "all"));
+    assert.equal(cleared.episodesAffected, 1);
+    const empty = await admin.exportGraph();
+    for (const rows of Object.values(empty.tables)) assert.equal(rows?.length, 0);
+  } finally {
+    provider.close();
+    admin.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("deleting a replacement episode restores the previous temporal edge", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-admin-temporal-delete-"));
+  const file = join(temp, "graph.sqlite");
+  const provider = new SqliteGraphProvider(file);
+  const admin = new GraphAdmin(file);
+  try {
+    await provider.ingestEpisode({
+      id: "pref-old",
+      sessionKey: "agent:main:preference",
+      occurredAt: "2026-08-01T00:00:00.000Z",
+      source: "test",
+      summary: "The user preferred DeepSeek.",
+      entities: [{ name: "user", type: "User" }, { name: "DeepSeek", type: "Model" }],
+      relations: [{ from: "user", type: "prefers", to: "DeepSeek", confidence: 0.9 }],
+    });
+    await provider.ingestEpisode({
+      id: "pref-new",
+      sessionKey: "agent:main:preference",
+      occurredAt: "2026-08-20T00:00:00.000Z",
+      source: "test",
+      summary: "The user now prefers GPT-5.6.",
+      entities: [{ name: "user", type: "User" }, { name: "GPT-5.6", type: "Model" }],
+      relations: [{ from: "user", type: "prefers", to: "GPT-5.6", confidence: 0.95 }],
+    });
+    provider.close();
+    assert.equal((await admin.recentTemporalInvalidations()).events.length, 1);
+    await admin.deleteByEpisode("pref-new", guard(admin, "delete-episode", "pref-new"));
+    const snapshot = await admin.exportGraph();
+    const edges = snapshot.tables.edges ?? [];
+    assert.equal(edges.length, 1);
+    assert.equal(edges[0].episode_id, "pref-old");
+    assert.equal(edges[0].valid_to, null);
+    assert.equal((await admin.inspectEntity("GPT-5.6")).matches.length, 0);
+    assert.equal((await admin.recentTemporalInvalidations()).events.length, 0);
+  } finally {
+    provider.close();
+    admin.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("deleting a middle temporal episode rechains predecessor directly to successor", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-admin-temporal-middle-"));
+  const file = join(temp, "graph.sqlite");
+  const provider = new SqliteGraphProvider(file);
+  const admin = new GraphAdmin(file);
+  const preferenceEpisode = (id: string, occurredAt: string, model: string): GraphEpisodeInput => ({
+    id,
+    sessionKey: "agent:main:preference-chain",
+    occurredAt,
+    source: "test",
+    summary: `The user prefers ${model}.`,
+    entities: [{ name: "user", type: "User" }, { name: model, type: "Model" }],
+    relations: [{ from: "user", type: "prefers", to: model, confidence: 0.95 }],
+  });
+  try {
+    await provider.ingestEpisode(preferenceEpisode("pref-a", "2026-08-01T00:00:00.000Z", "DeepSeek"));
+    await provider.ingestEpisode(preferenceEpisode("pref-b", "2026-08-10T00:00:00.000Z", "GPT-5.6"));
+    await provider.ingestEpisode(preferenceEpisode("pref-c", "2026-08-20T00:00:00.000Z", "Claude"));
+    provider.close();
+    await admin.deleteByEpisode("pref-b", guard(admin, "delete-episode", "pref-b"));
+
+    const outgoing = (await admin.inspectEntity("user")).matches[0].outgoingEdges;
+    assert.equal(outgoing.length, 2);
+    const first = outgoing.find((edge) => edge.episode_id === "pref-a");
+    const current = outgoing.find((edge) => edge.episode_id === "pref-c");
+    assert.equal(first?.valid_to, "2026-08-20T00:00:00.000Z");
+    assert.equal(first?.to_name, "DeepSeek");
+    assert.equal(current?.valid_to, null);
+    assert.equal(current?.to_name, "Claude");
+
+    const invalidations = await admin.recentTemporalInvalidations();
+    assert.equal(invalidations.events.length, 1);
+    assert.equal(invalidations.events[0].edge_id, first?.id);
+    assert.equal(invalidations.events[0].invalidated_by_episode_id, "pref-c");
+    assert.doesNotMatch(JSON.stringify(await admin.exportGraph()), /pref-b/);
+  } finally {
+    provider.close();
+    admin.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("vector episode markdown preserves technical identifiers and rebuilds deterministically", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-admin-vector-"));
+  const file = join(temp, "graph.sqlite");
+  const vectorDir = join(temp, "episodes");
+  const provider = new SqliteGraphProvider(file);
+  const admin = new GraphAdmin(file, temp);
+  const markdown = `# Memory episode ep-vector
+
+- Occurred: 2026-08-03T00:00:00.000Z
+- Session: agent:main:vector
+- Run: run-vector
+
+## Summary
+
+openclaw-human-gate uses before_prompt_build in C:\\repo\\activeRecall.ts.
+
+## Entities
+
+- openclaw-human-gate (Project); aliases: human-gate, hg
+- before_prompt_build (Tool)
+
+## Relations
+
+- openclaw-human-gate --uses--> before_prompt_build; confidence: 0.93; validFrom: 2026-08-03T00:00:00.000Z
+`;
+  try {
+    const parsed = parseVectorEpisodeMarkdown(markdown, "memory/graph-memory/episodes/ep-vector.md");
+    assert.equal(parsed?.summary, "openclaw-human-gate uses before_prompt_build in C:\\repo\\activeRecall.ts.");
+    assert.equal(parsed?.entities[1].name, "before_prompt_build");
+    assert.equal(parsed?.relations[0].to, "before_prompt_build");
+    assert.equal(parsed?.relations[0].confidence, 0.93);
+    assert.equal(parsed?.relations[0].validFrom, "2026-08-03T00:00:00.000Z");
+    await provider.ingestEpisode(episode("old", "agent:main:old", "2026-08-01T00:00:00.000Z"));
+    provider.close();
+    await import("node:fs/promises").then(({ mkdir }) => mkdir(vectorDir, { recursive: true }));
+    await writeFile(join(vectorDir, "ep-vector.md"), markdown, "utf8");
+    const target = process.platform === "win32" ? resolve(vectorDir).toLocaleLowerCase("en-US") : resolve(vectorDir);
+    const rebuilt = await admin.rebuildFromVectorDirectory(vectorDir, guard(admin, "rebuild-vector", target));
+    assert.equal(rebuilt.episodesAffected, 1);
+    const snapshot = await admin.exportGraph();
+    assert.deepEqual(snapshot.tables.episodes?.map((row) => row.id), ["ep-vector"]);
+    assert.equal((await admin.inspectEntity("before_prompt_build")).matches.length, 1);
+  } finally {
+    provider.close();
+    admin.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("CLI destructive commands default to a no-write token preview", async () => {
+  const source = await readFile(new URL("../scripts/graph-admin.mjs", import.meta.url), "utf8");
+  assert.match(source, /No database changes were made/);
+  assert.match(source, /--expected-db/);
+  assert.match(source, /--confirm/);
+});

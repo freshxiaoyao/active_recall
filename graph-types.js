@@ -63,6 +63,8 @@ export const RELATION_TYPES = [
 
 
 
+
+
 export function isEntityType(value         )                      {
   return typeof value === "string" && (ENTITY_TYPES                     ).includes(value);
 }

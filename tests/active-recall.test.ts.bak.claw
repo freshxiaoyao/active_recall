@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanPromptForSearch } from "../clean-prompt.js";
 import { readConfig } from "../config.js";
-import { evaluateRecallDemand } from "../demand.js";
+import { evaluateRecallDemand, routeRecallQuery } from "../demand.js";
 import { buildExpansionSearchRoutes, expandQuery, parseExpansionContent } from "../expansion.js";
 import { canonicalPath, fuseRoutes, isStrongSignal, passesQualityGate, successfulRoutes } from "../fusion.js";
-import { injectContext, isInternalSession, runRecall } from "../index.js";
+import activeRecallPlugin, { injectContext, isInternalSession, resolveRecallRoute, runRecall } from "../index.js";
 import { evaluateSemanticRecall, parseSemanticGateContent } from "../semantic-gate.js";
 import type { SearchRoute } from "../fusion.js";
 
@@ -43,6 +42,7 @@ test("internal memory, heartbeat, cron, and dreaming sessions never recall", () 
     "agent:main:heartbeat",
     "agent:main:cron:job",
     "agent:main:dreaming-narrative-light-123",
+    "agent:main:graph-memory-writer:child",
   ]) assert.equal(isInternalSession(session), true, session);
   assert.equal(isInternalSession("agent:main:dashboard:user-session"), false);
 });
@@ -101,9 +101,10 @@ test("explicit prefixes force recall and are removed from the search query", () 
     reason: "explicit_prefix",
     confidence: 1,
     depth: undefined,
+    route: "vector",
   });
   assert.deepEqual(evaluateRecallDemand("/recall deep human-gate decisions", trigger), {
-    decision: "yes", query: "human-gate decisions", reason: "explicit_prefix", confidence: 1, depth: "deep",
+    decision: "yes", query: "human-gate decisions", reason: "explicit_prefix", confidence: 1, depth: "deep", route: "vector",
   });
   assert.equal(evaluateRecallDemand("/recaller is a command name", trigger).decision, "no");
 });
@@ -121,7 +122,23 @@ test("explicit and always modes plus suppression remain configurable", () => {
     reason: "suppressed",
     confidence: 1,
     depth: "none",
+    route: "none",
   });
+});
+
+test("route gate selects graph and hybrid without an LLM", () => {
+  assert.equal(routeRecallQuery("human-gate 和 Codex 有什么关系？"), "graph");
+  assert.equal(routeRecallQuery("我以前偏好什么模型，现在改成什么了？"), "graph");
+  assert.equal(routeRecallQuery("综合我所有项目、工具和偏好的关联"), "hybrid");
+  assert.equal(routeRecallQuery("还记得我们上次的决定吗？"), "vector");
+  const disabled = readConfig({ graphMemory: { enabled: false } });
+  assert.equal(resolveRecallRoute("graph", disabled), "vector");
+  const trigger = readConfig({}).trigger;
+  assert.deepEqual(
+    { decision: evaluateRecallDemand("human-gate 和 Codex 有什么关系？", trigger).decision, route: evaluateRecallDemand("human-gate 和 Codex 有什么关系？", trigger).route },
+    { decision: "yes", route: "graph" },
+  );
+  assert.equal(evaluateRecallDemand("法国和德国有什么关系？", trigger).decision, "no");
 });
 
 test("RRF ranks a repeated result before one literal-only result", () => {
@@ -542,8 +559,33 @@ test("runRecall keeps fail-open when literal search throws", async () => {
   assert.equal(result, undefined);
 });
 
+test("graph timeout falls back to vector without failing prompt build", async () => {
+  let vectorSearches = 0;
+  const config = readConfig({ graphMemory: { enabled: true, readTimeoutMs: 20 }, trace: { enabled: false } });
+  const empty = searchResult([]);
+  const result = await runRecall(pluginApi, { prompt: "/recall graph human-gate 和 Codex 的关系" }, recallCtx, config, {
+    graphSearch: async () => new Promise((_resolve, reject) => setTimeout(() => reject(new Error("graph timeout")), 1)),
+    profileSearch: async () => empty,
+    search: async () => { vectorSearches += 1; return searchResult([{ path: "memory/fallback.md", score: 0.9 }]); },
+  });
+  assert.equal(vectorSearches, 1);
+  assert.match(result?.prependContext ?? "", /memory\/fallback\.md/);
+});
+
+test("hybrid recall fuses graph and vector hits under separate sources", async () => {
+  const config = readConfig({ graphMemory: { enabled: true }, trace: { enabled: false }, topK: 4 });
+  const empty = searchResult([]);
+  const result = await runRecall(pluginApi, { prompt: "/recall hybrid 综合 human-gate 项目和工具关系" }, recallCtx, config, {
+    graphSearch: async () => searchResult([{ path: "memory/graph.md", score: 0.91, source: "graph", snippet: "human-gate --maintained_with--> Codex" }]),
+    profileSearch: async () => empty,
+    search: async () => searchResult([{ path: "memory/vector.md", score: 0.9, source: "memory", snippet: "episodic project note" }]),
+  });
+  assert.match(result?.prependContext ?? "", /human-gate --maintained_with--> Codex/);
+  assert.match(result?.prependContext ?? "", /episodic project note/);
+});
+
 test("runRecall trace includes phase latency and separated rank metrics", async () => {
-  const temp = await mkdtemp(join(tmpdir(), "active-recall-trace-"));
+  const temp = await mkdtemp(join(process.cwd(), ".active-recall-trace-"));
   const file = join(temp, "trace.jsonl");
   try {
     const config = readConfig({ trace: { enabled: true, file } });
@@ -601,7 +643,20 @@ test("quality-tuned defaults stay aligned", () => {
   assert.equal(config.strongSignal.sources.sessions.gap, 0.2);
   assert.equal(config.rrf.k, 20);
   assert.equal(config.rrf.rawScoreBlend, 0.5);
+  assert.equal(config.graphMemory.enabled, false);
+  assert.equal(config.graphMemory.provider, "local-sqlite");
+  assert.equal(config.graphMemory.readTimeoutMs, 120);
   assert.equal(canonicalPath("memory\\Example.md"), canonicalPath("memory/Example.md"));
+});
+
+test("agent_end writer hook is registered only when graph memory is enabled", () => {
+  const disabledEvents: string[] = [];
+  activeRecallPlugin.register({ pluginConfig: {}, on: (event: string) => { disabledEvents.push(event); } } as never);
+  assert.deepEqual(disabledEvents, ["before_prompt_build"]);
+
+  const enabledEvents: string[] = [];
+  activeRecallPlugin.register({ pluginConfig: { graphMemory: { enabled: true } }, on: (event: string) => { enabledEvents.push(event); } } as never);
+  assert.deepEqual(enabledEvents, ["before_prompt_build", "agent_end"]);
 });
 
 test("legacy quality threshold and expansion model remain backward compatible", () => {

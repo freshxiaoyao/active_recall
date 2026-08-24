@@ -127,6 +127,7 @@ function normalizeMemoryHit(value
 
 
 
+
 function withTimeout   (promise            , ms        )             {
   return new Promise   ((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), Math.max(1, ms));
@@ -172,15 +173,19 @@ function loadInProcessSdk()                                                     
 
 /** 进程内检索：gateway 已注册的 memory runtime 直接复用（无 spawn，~毫秒级）。失败或超时返回 null。 */
 async function tryInProcessSearch(query        , options               , timeoutMs        )                               {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`memory search timeout after ${timeoutMs}ms`)), Math.max(1, timeoutMs));
   try {
-    return await withTimeout(inProcessSearchInner(query, options), timeoutMs);
+    return await withTimeout(inProcessSearchInner(query, options, controller.signal), timeoutMs);
   } catch (error) {
     diagLog(`in-process failed: ${error instanceof Error ? error.message : String(error)}`);
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-async function inProcessSearchInner(query        , options               )                               {
+async function inProcessSearchInner(query        , options               , signal              )                               {
   try {
     const sdk = await loadInProcessSdk();
     if (!sdk) { diagLog("sdk unavailable"); return null; }
@@ -191,7 +196,7 @@ async function inProcessSearchInner(query        , options               )      
     if (managerError) diagLog(`manager error: ${managerError}`);
     if (!manager?.search) { diagLog("manager.search missing"); return null; }
     const startedAt = performance.now();
-    const results = await manager.search(query, { maxResults: options.maxResults, minScore: options.minScore });
+    const results = await manager.search(query, { maxResults: options.maxResults, minScore: options.minScore, signal });
     const elapsed = Math.round(performance.now() - startedAt);
     diagLog(`in-process ok: ${elapsed}ms hits=${(results ?? []).length}`);
     return {
@@ -203,6 +208,19 @@ async function inProcessSearchInner(query        , options               )      
     diagLog(`inner failed: ${error instanceof Error ? error.message : String(error)}`);
     return null;
   }
+}
+
+/** Best-effort background indexing after a writer adds a memory markdown episode. */
+export async function triggerMemorySync(agentId        )                   {
+  const sdk = await loadInProcessSdk();
+  if (!sdk) return false;
+  const cfgPath = join(homedir(), ".openclaw", "openclaw.json");
+  if (!existsSync(cfgPath)) return false;
+  const cfg = JSON.parse(await readFile(cfgPath, "utf8"))           ;
+  const { manager } = await sdk.getActiveMemorySearchManager({ cfg, agentId });
+  if (!manager?.sync) return false;
+  await manager.sync({ reason: "active-recall-graph-writer" });
+  return true;
 }
 
 /** 先走进程内（gateway 已缓存 manager），失败回退 CLI shell-out。 */

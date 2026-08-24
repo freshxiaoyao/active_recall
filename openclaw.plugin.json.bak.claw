@@ -1,7 +1,7 @@
 {
   "id": "active-recall",
   "name": "Active Recall",
-  "description": "On-demand memory recall with a tri-state zero-LLM fast path, short semantic fallback, structured query expansion, and multi-route RRF retrieval. Thin companion over the existing memory_search backend; does NOT own the memory slot.",
+  "description": "On-demand hybrid Profile, Vector, and Temporal Graph Memory with a zero-LLM route gate, bounded retrieval, RRF fusion, and a non-blocking agent_end writer. Graph Memory is optional and defaults off.",
   "activation": {
     "onCapabilities": ["hook"]
   },
@@ -112,6 +112,37 @@
         "properties": {
           "enabled": { "type": "boolean", "default": true },
           "file": { "type": "string", "default": "memory/recall-traces.jsonl" }
+        }
+      },
+      "graphMemory": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "provider": { "type": "string", "enum": ["local-sqlite", "graphiti", "falkordb", "neo4j"], "default": "local-sqlite" },
+          "file": { "type": "string", "default": "memory/graph-memory/graph-memory-v1.sqlite" },
+          "profileFile": { "type": "string", "default": "memory/profile-memory.json" },
+          "vectorDir": { "type": "string", "default": "memory/graph-memory/episodes" },
+          "readTimeoutMs": { "type": "integer", "minimum": 10, "maximum": 5000, "default": 120 },
+          "writeTimeoutMs": { "type": "integer", "minimum": 500, "maximum": 60000, "default": 12000 },
+          "routeMode": { "type": "string", "enum": ["auto", "vector", "graph", "hybrid"], "default": "auto" },
+          "maxGraphResults": { "type": "integer", "minimum": 1, "maximum": 20, "default": 4 },
+          "maxHops": { "type": "integer", "minimum": 1, "maximum": 4, "default": 2 },
+          "profileBudget": { "type": "integer", "minimum": 0, "maximum": 2000, "default": 160 },
+          "vectorBudget": { "type": "integer", "minimum": 0, "maximum": 4000, "default": 600 },
+          "graphBudget": { "type": "integer", "minimum": 0, "maximum": 2000, "default": 300 },
+          "writer": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean", "default": true },
+              "model": { "type": "string", "description": "Defaults to expansion.model" },
+              "timeoutMs": { "type": "integer", "minimum": 500, "maximum": 30000, "default": 8000 },
+              "maxOutputTokens": { "type": "integer", "minimum": 100, "maximum": 4000, "default": 1200 },
+              "maxInputChars": { "type": "integer", "minimum": 1000, "maximum": 50000, "default": 12000 },
+              "traceFile": { "type": "string", "default": "memory/graph-memory/write-traces.jsonl" }
+            }
+          }
         }
       },
       "disableActiveMemoryHint": { "type": "boolean", "default": true }

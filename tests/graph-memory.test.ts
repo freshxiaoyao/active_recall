@@ -1,11 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { readConfig } from "../config.js";
 import { normalizeEntityAlias } from "../entity-resolution.js";
 import { SqliteGraphProvider } from "../graph-provider.js";
-import { lastConversationTurn, runMemoryWrite, shouldSkipMemoryWrite } from "../memory-writer.js";
+import {
+  effectiveWriterMode,
+  lastConversationTurn,
+  resetWriterQueueForTests,
+  runMemoryWrite,
+  sessionAllowed,
+  shouldSkipMemoryWrite,
+  writerCircuitStateForTests,
+} from "../memory-writer.js";
 import type { GraphEpisodeInput } from "../graph-types.js";
 
 const episode = (input: Partial<GraphEpisodeInput> & Pick<GraphEpisodeInput, "id" | "entities" | "relations">): GraphEpisodeInput => ({
@@ -14,6 +22,21 @@ const episode = (input: Partial<GraphEpisodeInput> & Pick<GraphEpisodeInput, "id
   source: "test",
   summary: input.id,
   ...input,
+});
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("generated provider loads node:sqlite lazily", async () => {
+  const source = await readFile(new URL("../graph-provider.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /^import\s+.*["']node:sqlite["']/m);
+  assert.match(source, /await import\(["']node:sqlite["']\)/);
 });
 
 test("entity aliases resolve human-gate variants to one entity", async () => {
@@ -41,6 +64,9 @@ test("entity aliases resolve human-gate variants to one entity", async () => {
       assert.equal((await provider.entityForAlias(alias))?.id, canonical?.id, alias);
     }
     assert.equal(normalizeEntityAlias("OpenClaw Human-Gate"), "openclawhumangate");
+    assert.equal(normalizeEntityAlias("C:\\Repo\\activeRecall.ts"), "c:/repo/activerecall.ts");
+    assert.equal(normalizeEntityAlias("@openclaw/active-recall"), "@openclaw/active-recall");
+    assert.notEqual(normalizeEntityAlias("demand.ts"), normalizeEntityAlias("demandts"));
   } finally {
     provider.close();
     await rm(temp, { recursive: true, force: true });
@@ -150,5 +176,230 @@ test("async writer is idempotent across graph, profile, and vector stores", asyn
     assert.equal(profile.facts.length, 1);
   } finally {
     await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("writer rollout mode is independent from Graph read and session allowlist is exact or prefix-only", () => {
+  const off = readConfig({ graphMemory: { enabled: false } });
+  const dryRun = readConfig({
+    graphMemory: { enabled: false, writer: { mode: "dry-run", sessionAllowlist: ["agent:main:test", "agent:main:pilot:*"] } },
+  });
+  assert.equal(effectiveWriterMode(off), "off");
+  assert.equal(effectiveWriterMode(dryRun), "dry-run");
+  assert.equal(sessionAllowed("agent:main:test", dryRun.graphMemory.writer.sessionAllowlist), true);
+  assert.equal(sessionAllowed("agent:main:pilot:one", dryRun.graphMemory.writer.sessionAllowlist), true);
+  assert.equal(sessionAllowed("agent:main:other", dryRun.graphMemory.writer.sessionAllowlist), false);
+  const event = { success: true, messages: [{ role: "user", content: "u" }, { role: "assistant", content: "a" }] };
+  assert.equal(shouldSkipMemoryWrite(event, { agentId: "main", sessionKey: "agent:main:other" }, dryRun), "session_not_allowed");
+});
+
+test("dry-run extracts, applies per-turn limits, traces, and never creates stores", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-memory-dry-run-"));
+  const graphFile = join(temp, "graph.sqlite");
+  const profileFile = join(temp, "profile.json");
+  const vectorDir = join(temp, "episodes");
+  const traceFile = join(temp, "writer.jsonl");
+  const config = readConfig({
+    graphMemory: {
+      enabled: false,
+      file: graphFile,
+      profileFile,
+      vectorDir,
+      writer: {
+        mode: "dry-run",
+        traceFile,
+        maxEntitiesPerTurn: 2,
+        maxEdgesPerTurn: 1,
+      },
+    },
+  });
+  const extract = async () => ({
+    summary: "bounded extraction",
+    entities: [
+      { name: "user", type: "User" as const },
+      { name: "project", type: "Project" as const },
+      { name: "Codex", type: "Tool" as const },
+    ],
+    relations: [
+      { from: "user", type: "develops" as const, to: "project" },
+      { from: "project", type: "maintained_with" as const, to: "Codex" },
+    ],
+    profileFacts: [],
+  });
+  try {
+    const result = await runMemoryWrite(
+      {},
+      { runId: "dry-run-1", success: true, messages: [{ role: "user", content: "u" }, { role: "assistant", content: "a" }] },
+      { agentId: "main", sessionKey: "agent:main:test", workspaceDir: temp },
+      config,
+      { extract, sync: async () => true },
+    );
+    assert.equal(result.status, "ok");
+    assert.equal(result.mode, "dry-run");
+    assert.equal(result.extractedEntities, 3);
+    assert.equal(result.extractedEdges, 2);
+    assert.equal(result.entitiesTruncated, 1);
+    assert.equal(result.edgesTruncated, 1);
+    assert.equal(await pathExists(graphFile), false);
+    assert.equal(await pathExists(profileFile), false);
+    assert.equal(await pathExists(vectorDir), false);
+    const trace = JSON.parse((await readFile(traceFile, "utf8")).trim()) as Record<string, unknown>;
+    assert.equal(trace.episodeId, result.episodeId);
+    assert.equal(trace.sessionKey, "agent:main:test");
+    assert.equal(trace.runId, "dry-run-1");
+    assert.equal(trace.timeout, false);
+    assert.equal(trace.failureReason, undefined);
+    assert.equal(typeof trace.durationMs, "number");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("writer timeout is fail-open and consecutive failures open the circuit", async () => {
+  resetWriterQueueForTests();
+  const temp = await mkdtemp(join(process.cwd(), ".graph-memory-circuit-"));
+  const config = readConfig({
+    graphMemory: {
+      enabled: false,
+      file: join(temp, "graph.sqlite"),
+      writeTimeoutMs: 30,
+      writer: {
+        mode: "write",
+        timeoutMs: 10,
+        traceFile: join(temp, "writer.jsonl"),
+        circuitBreaker: { failureThreshold: 2, resetAfterMs: 60000 },
+      },
+    },
+  });
+  const event = { runId: "timeout-run", success: true, messages: [{ role: "user", content: "u" }, { role: "assistant", content: "a" }] };
+  const ctx = { agentId: "main", sessionKey: "agent:main:test", workspaceDir: temp };
+  const extract = async () => new Promise<never>(() => {});
+  try {
+    const first = await runMemoryWrite({}, event, ctx, config, { extract });
+    const second = await runMemoryWrite({}, event, ctx, config, { extract });
+    const third = await runMemoryWrite({}, event, ctx, config, { extract });
+    assert.equal(first.status, "timeout");
+    assert.equal(first.circuitOpen, false);
+    assert.equal(second.status, "timeout");
+    assert.equal(second.circuitOpen, true);
+    assert.equal(third.status, "skipped");
+    assert.equal(third.circuitOpen, true);
+    assert.match(third.reason ?? "", /^circuit_open_until:/);
+    assert.equal(writerCircuitStateForTests(config, ctx)?.consecutiveFailures, 2);
+    assert.equal(await pathExists(join(temp, "graph.sqlite")), false);
+  } finally {
+    resetWriterQueueForTests();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("same alias across entity types stays distinct and ambiguous untyped lookup fails closed", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-memory-homonym-"));
+  const provider = new SqliteGraphProvider(join(temp, "graph.sqlite"));
+  try {
+    await provider.ingestEpisode(episode({
+      id: "homonym-1",
+      entities: [{ name: "Atlas", type: "Project" }, { name: "Atlas", type: "Tool" }],
+      relations: [],
+    }));
+    const project = await provider.entityForAlias("Atlas", "Project");
+    const tool = await provider.entityForAlias("Atlas", "Tool");
+    assert.ok(project);
+    assert.ok(tool);
+    assert.notEqual(project?.id, tool?.id);
+    assert.equal(await provider.entityForAlias("Atlas"), undefined);
+  } finally {
+    provider.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("vague aliases attach to a resolved entity but never drive a same-type merge", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-memory-vague-alias-"));
+  const provider = new SqliteGraphProvider(join(temp, "graph.sqlite"));
+  try {
+    await provider.ingestEpisode(episode({
+      id: "vague-1",
+      entities: [{ name: "human-gate", type: "Project", aliases: ["那个插件"] }],
+      relations: [],
+    }));
+    const second = await provider.ingestEpisode(episode({
+      id: "vague-2",
+      entities: [{ name: "release-helper", type: "Project", aliases: ["那个插件"] }],
+      relations: [],
+    }));
+    assert.equal(second.entitiesCreated, 1);
+    assert.equal(second.entityMerges, 0);
+    assert.notEqual(
+      (await provider.entityForAlias("human-gate", "Project"))?.id,
+      (await provider.entityForAlias("release-helper", "Project"))?.id,
+    );
+  } finally {
+    provider.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("repeated fact across episodes keeps one edge and adds episode provenance", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-memory-provenance-"));
+  const provider = new SqliteGraphProvider(join(temp, "graph.sqlite"));
+  try {
+    const base = {
+      entities: [{ name: "human-gate", type: "Project" as const }, { name: "Codex", type: "Tool" as const }],
+      relations: [{ from: "human-gate", type: "maintained_with" as const, to: "Codex" }],
+    };
+    const first = await provider.ingestEpisode(episode({ id: "fact-1", ...base }));
+    const second = await provider.ingestEpisode(episode({ id: "fact-2", occurredAt: "2026-08-24T01:00:00.000Z", ...base }));
+    assert.equal(first.relationsCreated, 1);
+    assert.equal(second.relationsCreated, 0);
+    assert.equal(second.duplicateRelations, 1);
+    assert.equal(second.provenanceLinks, 1);
+    const sqlite = await import("node:sqlite");
+    const db = new sqlite.DatabaseSync(join(temp, "graph.sqlite"), { readOnly: true });
+    try {
+      assert.equal((db.prepare("SELECT COUNT(*) AS count FROM edges").get() as { count: number }).count, 1);
+      assert.equal((db.prepare("SELECT COUNT(*) AS count FROM edge_provenance").get() as { count: number }).count, 2);
+    } finally {
+      db.close();
+    }
+  } finally {
+    provider.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("out-of-order temporal facts produce the same closed history", async () => {
+  const temp = await mkdtemp(join(process.cwd(), ".graph-memory-backfill-"));
+  const provider = new SqliteGraphProvider(join(temp, "graph.sqlite"));
+  try {
+    await provider.ingestEpisode(episode({
+      id: "current",
+      occurredAt: "2026-08-20T00:00:00.000Z",
+      entities: [{ name: "user", type: "User" }, { name: "GPT-5.6", type: "Model" }],
+      relations: [{ from: "user", type: "prefers", to: "GPT-5.6" }],
+    }));
+    await provider.ingestEpisode(episode({
+      id: "historical",
+      occurredAt: "2026-08-01T00:00:00.000Z",
+      entities: [{ name: "user", type: "User" }, { name: "DeepSeek", type: "Model" }],
+      relations: [{ from: "user", type: "prefers", to: "DeepSeek" }],
+    }));
+    const history = await provider.activeRelations("user", "prefers");
+    assert.equal(history.find((item) => item.toName === "DeepSeek")?.validTo, "2026-08-20T00:00:00.000Z");
+    assert.equal(history.find((item) => item.toName === "GPT-5.6")?.validTo, null);
+  } finally {
+    provider.close();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("writer recursion guard covers cron and heartbeat naming variants", () => {
+  const config = readConfig({ graphMemory: { writer: { mode: "dry-run" } } });
+  const event = { success: true, messages: [{ role: "user", content: "u" }, { role: "assistant", content: "a" }] };
+  for (const sessionKey of [
+    "agent:main:cron-job", "agent:main:heartbeat_worker", "agent:main:dreaming:one",
+    "agent:main:active-memory:one", "agent:main:graph-memory-writer:one", "agent:main:memory-writer_one",
+  ]) {
+    assert.equal(shouldSkipMemoryWrite(event, { agentId: "main", sessionKey }, config), "internal_session", sessionKey);
   }
 });

@@ -163,6 +163,11 @@ export async function expandQuery(
   maxAssociations        ,
 )                            {
   const emptyDiagnostics                       = { parseMode: "none", contentChars: 0 };
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new DOMException(`rescue timeout after ${config.timeoutMs}ms`, "TimeoutError")),
+    Math.max(1, config.timeoutMs),
+  );
   try {
     const apiKey = process.env[config.apiKeyEnv];
     const headers                         = {
@@ -175,7 +180,7 @@ export async function expandQuery(
     const response = await fetch(`${config.endpoint}/chat/completions`, {
       method: "POST",
       headers,
-      signal: AbortSignal.timeout(config.timeoutMs),
+      signal: controller.signal,
       body: JSON.stringify({
         model: config.model,
         messages: [{ role: "user", content: expansionPrompt(message, maxAssociations) }],
@@ -230,6 +235,8 @@ export async function expandQuery(
       status: timeout ? "timeout" : "request_fail",
       diagnostics: { ...emptyDiagnostics, failureReason: timeout ? "timeout" : "request_fail" },
     };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { entityAliases, normalizeEntityAlias, queryAliasScore } from "./entity-resolution.js";
+
+
 
 
 
@@ -50,6 +51,16 @@ function stableId(prefix        , value        )         {
   return `${prefix}_${createHash("sha256").update(value, "utf8").digest("hex").slice(0, 24)}`;
 }
 
+function aliasKey(type        , normalized        )         {
+  return `${type}:${normalized}`;
+}
+
+function aliasCanDriveResolution(normalized        , index        )          {
+  if (index === 0) return true;
+  if (normalized.length < 4) return false;
+  return !/^(?:那个|这个|之前那个|我的|this|that|my)?(?:插件|项目|工具|模型|设备|软件|plugin|project|tool|model|device|software)$/i.test(normalized);
+}
+
 function clampConfidence(value                    )         {
   return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.85;
 }
@@ -75,7 +86,10 @@ export class SqliteGraphProvider                          {
           async database()                        {
     if (this.db) return this.db;
     await mkdir(dirname(this.file), { recursive: true });
-    const db = new DatabaseSync(this.file);
+    // Keep SQLite out of plugin module initialization. With Graph disabled,
+    // older Node runtimes can still load the Vector-only plugin path.
+    const sqlite = await import("node:sqlite");
+    const db = new sqlite.DatabaseSync(this.file);
     db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1000;");
     db.exec(`
       CREATE TABLE IF NOT EXISTS episodes (
@@ -86,6 +100,9 @@ export class SqliteGraphProvider                          {
         source TEXT NOT NULL,
         source_path TEXT,
         summary TEXT NOT NULL,
+        payload_json TEXT,
+        content_hash TEXT,
+        schema_version INTEGER NOT NULL DEFAULT 2,
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS entities (
@@ -94,11 +111,6 @@ export class SqliteGraphProvider                          {
         canonical_name TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS entity_aliases (
-        alias_norm TEXT PRIMARY KEY,
-        alias TEXT NOT NULL,
-        entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE
       );
       CREATE TABLE IF NOT EXISTS edges (
         id TEXT PRIMARY KEY,
@@ -115,24 +127,122 @@ export class SqliteGraphProvider                          {
       CREATE INDEX IF NOT EXISTS idx_edges_to_active ON edges(to_entity_id, relation_type, valid_to);
       CREATE INDEX IF NOT EXISTS idx_edges_episode ON edges(episode_id);
     `);
+    const episodeColumns = db.prepare("PRAGMA table_info(episodes)").all()                                      ;
+    if (!episodeColumns.some((column) => column.name === "payload_json")) {
+      db.exec("ALTER TABLE episodes ADD COLUMN payload_json TEXT");
+    }
+    if (!episodeColumns.some((column) => column.name === "content_hash")) {
+      db.exec("ALTER TABLE episodes ADD COLUMN content_hash TEXT");
+    }
+    if (!episodeColumns.some((column) => column.name === "schema_version")) {
+      db.exec("ALTER TABLE episodes ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1");
+    }
+    const aliasColumns = db.prepare("PRAGMA table_info(entity_aliases)").all()                                      ;
+    if (aliasColumns.length === 0) {
+      db.exec(`CREATE TABLE entity_aliases (
+        alias_key TEXT PRIMARY KEY,
+        alias_norm TEXT NOT NULL,
+        alias TEXT NOT NULL,
+        entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE
+      )`);
+    } else if (!aliasColumns.some((column) => column.name === "alias_key")) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.exec(`
+          ALTER TABLE entity_aliases RENAME TO entity_aliases_legacy;
+          CREATE TABLE entity_aliases (
+            alias_key TEXT PRIMARY KEY,
+            alias_norm TEXT NOT NULL,
+            alias TEXT NOT NULL,
+            entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE
+          );
+          INSERT OR IGNORE INTO entity_aliases(alias_key, alias_norm, alias, entity_id)
+            SELECT e.type || ':' || legacy.alias_norm, legacy.alias_norm, legacy.alias, legacy.entity_id
+            FROM entity_aliases_legacy legacy JOIN entities e ON e.id = legacy.entity_id;
+          DROP TABLE entity_aliases_legacy;
+        `);
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_aliases_norm ON entity_aliases(alias_norm);
+      CREATE INDEX IF NOT EXISTS idx_aliases_entity ON entity_aliases(entity_id);
+      CREATE TABLE IF NOT EXISTS edge_provenance (
+        edge_id TEXT NOT NULL REFERENCES edges(id) ON DELETE CASCADE,
+        episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY(edge_id, episode_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_edge_provenance_episode ON edge_provenance(episode_id);
+      CREATE TABLE IF NOT EXISTS entity_merge_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_entity_id TEXT NOT NULL,
+        duplicate_entity_id TEXT NOT NULL,
+        target_name TEXT NOT NULL,
+        duplicate_name TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        episode_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        merged_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS temporal_invalidation_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        edge_id TEXT NOT NULL,
+        invalidated_by_episode_id TEXT NOT NULL,
+        previous_valid_to TEXT,
+        new_valid_to TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT OR IGNORE INTO edge_provenance(edge_id, episode_id, observed_at)
+        SELECT id, episode_id, valid_from FROM edges;
+      PRAGMA user_version=2;
+    `);
     this.db = db;
     return db;
   }
 
-          mergeEntity(db              , targetId        , duplicateId        )       {
+          mergeEntity(db              , targetId        , duplicateId        , episodeId        , now        )       {
     if (targetId === duplicateId) return;
+    const target = db.prepare("SELECT canonical_name, type FROM entities WHERE id = ?").get(targetId)                                                          ;
+    const duplicate = db.prepare("SELECT canonical_name, type FROM entities WHERE id = ?").get(duplicateId)                                                          ;
     db.prepare("UPDATE edges SET from_entity_id = ? WHERE from_entity_id = ?").run(targetId, duplicateId);
     db.prepare("UPDATE edges SET to_entity_id = ? WHERE to_entity_id = ?").run(targetId, duplicateId);
     db.prepare("UPDATE OR IGNORE entity_aliases SET entity_id = ? WHERE entity_id = ?").run(targetId, duplicateId);
     db.prepare("DELETE FROM entity_aliases WHERE entity_id = ?").run(duplicateId);
     db.prepare("DELETE FROM entities WHERE id = ?").run(duplicateId);
+    db.prepare(`INSERT INTO entity_merge_events(
+        target_entity_id, duplicate_entity_id, target_name, duplicate_name,
+        entity_type, episode_id, reason, merged_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        targetId,
+        duplicateId,
+        target?.canonical_name ?? targetId,
+        duplicate?.canonical_name ?? duplicateId,
+        target?.type ?? duplicate?.type ?? "unknown",
+        episodeId,
+        "same-type alias overlap",
+        now,
+      );
   }
 
   async ingestEpisode(episode                   )                            {
     const db = await this.database();
     const existing = db.prepare("SELECT id FROM episodes WHERE id = ?").get(episode.id)                               ;
     if (existing?.id) {
-      return { episodeId: episode.id, idempotent: true, entitiesCreated: 0, entityMerges: 0, relationsCreated: 0, temporalInvalidations: 0 };
+      return {
+        episodeId: episode.id,
+        idempotent: true,
+        entitiesCreated: 0,
+        entityMerges: 0,
+        relationsCreated: 0,
+        duplicateRelations: 0,
+        provenanceLinks: 0,
+        temporalInvalidations: 0,
+      };
     }
 
     const now = new Date().toISOString();
@@ -140,69 +250,159 @@ export class SqliteGraphProvider                          {
     let entitiesCreated = 0;
     let entityMerges = 0;
     let relationsCreated = 0;
+    let duplicateRelations = 0;
+    let provenanceLinks = 0;
     let temporalInvalidations = 0;
-    const entityIds = new Map                ();
+    const entityIds = new Map                     ();
+
+    const rememberEntityId = (normalized        , entityId        )       => {
+      const ids = entityIds.get(normalized) ?? new Set        ();
+      ids.add(entityId);
+      entityIds.set(normalized, ids);
+    };
+
+    const entityIdForReference = (value        )                     => {
+      const ids = entityIds.get(normalizeEntityAlias(value));
+      return ids?.size === 1 ? [...ids][0] : undefined;
+    };
 
     db.exec("BEGIN IMMEDIATE");
     try {
-      db.prepare(`INSERT INTO episodes(id, session_key, run_id, occurred_at, source, source_path, summary, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(episode.id, episode.sessionKey, episode.runId ?? null, occurredAt, episode.source, episode.sourcePath ?? null, episode.summary, now);
+      const payloadJson = JSON.stringify({ ...episode, occurredAt });
+      db.prepare(`INSERT INTO episodes(
+          id, session_key, run_id, occurred_at, source, source_path, summary,
+          payload_json, content_hash, schema_version, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?)`)
+        .run(
+          episode.id,
+          episode.sessionKey,
+          episode.runId ?? null,
+          occurredAt,
+          episode.source,
+          episode.sourcePath ?? null,
+          episode.summary,
+          payloadJson,
+          createHash("sha256").update(payloadJson, "utf8").digest("hex"),
+          now,
+        );
 
       for (const entity of episode.entities) {
         const aliases = entityAliases(entity);
         if (aliases.length === 0) continue;
         const matchedIds           = [];
-        for (const alias of aliases) {
-          const row = db.prepare("SELECT entity_id FROM entity_aliases WHERE alias_norm = ?").get(alias.normalized)                                      ;
+        // A short alias such as "hg" may be shared by unrelated entities. It can
+        // be attached after a canonical/strong match, but never drives a merge.
+        const resolutionAliases = aliases.filter((alias, index) => aliasCanDriveResolution(alias.normalized, index));
+        for (const alias of resolutionAliases) {
+          const row = db.prepare("SELECT entity_id FROM entity_aliases WHERE alias_key = ?")
+            .get(aliasKey(entity.type, alias.normalized))                                      ;
           if (row?.entity_id && !matchedIds.includes(row.entity_id)) matchedIds.push(row.entity_id);
         }
         let entityId = matchedIds[0];
         if (!entityId) {
           entityId = stableId("ent", `${entity.type}:${aliases[0].normalized}`);
-          db.prepare("INSERT OR IGNORE INTO entities(id, type, canonical_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+          const inserted = db.prepare("INSERT OR IGNORE INTO entities(id, type, canonical_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
             .run(entityId, entity.type, entity.name.trim(), now, now);
-          entitiesCreated += 1;
+          entitiesCreated += Number(inserted.changes ?? 0);
         } else {
           db.prepare("UPDATE entities SET updated_at = ? WHERE id = ?").run(now, entityId);
         }
         for (const duplicateId of matchedIds.slice(1)) {
-          this.mergeEntity(db, entityId, duplicateId);
+          this.mergeEntity(db, entityId, duplicateId, episode.id, now);
           entityMerges += 1;
         }
         for (const alias of aliases) {
-          db.prepare("INSERT OR IGNORE INTO entity_aliases(alias_norm, alias, entity_id) VALUES (?, ?, ?)")
-            .run(alias.normalized, alias.alias, entityId);
-          entityIds.set(alias.normalized, entityId);
+          db.prepare("INSERT OR IGNORE INTO entity_aliases(alias_key, alias_norm, alias, entity_id) VALUES (?, ?, ?, ?)")
+            .run(aliasKey(entity.type, alias.normalized), alias.normalized, alias.alias, entityId);
+          rememberEntityId(alias.normalized, entityId);
         }
       }
 
       for (const relation of episode.relations) {
-        const fromId = entityIds.get(normalizeEntityAlias(relation.from));
-        const toId = entityIds.get(normalizeEntityAlias(relation.to));
+        const fromId = entityIdForReference(relation.from);
+        const toId = entityIdForReference(relation.to);
         if (!fromId || !toId || fromId === toId) continue;
         const validFrom = isoOr(relation.validFrom, occurredAt);
         if (EXCLUSIVE_TEMPORAL_RELATIONS.has(relation.type)) {
-          const invalidated = db.prepare(`UPDATE edges SET valid_to = ?
+          const candidates = db.prepare(`SELECT id, valid_to FROM edges
             WHERE from_entity_id = ? AND relation_type = ? AND to_entity_id <> ?
-              AND valid_to IS NULL AND valid_from <= ?`)
-            .run(validFrom, fromId, relation.type, toId, validFrom);
-          temporalInvalidations += Number(invalidated.changes ?? 0);
+              AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)`)
+            .all(fromId, relation.type, toId, validFrom, validFrom)                                                             ;
+          for (const candidate of candidates) {
+            const invalidated = db.prepare("UPDATE edges SET valid_to = ? WHERE id = ? AND (valid_to IS NULL OR valid_to > ?)")
+              .run(validFrom, candidate.id, validFrom);
+            if (Number(invalidated.changes ?? 0) === 0) continue;
+            temporalInvalidations += 1;
+            db.prepare(`INSERT INTO temporal_invalidation_events(
+              edge_id, invalidated_by_episode_id, previous_valid_to, new_valid_to, created_at
+            ) VALUES (?, ?, ?, ?, ?)`)
+              .run(candidate.id, episode.id, candidate.valid_to, validFrom, now);
+          }
         }
-        const edgeId = stableId("edge", `${episode.id}:${fromId}:${relation.type}:${toId}:${validFrom}`);
+
+        const temporalMembership = EXCLUSIVE_TEMPORAL_RELATIONS.has(relation.type)
+          ? "AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)"
+          : "AND valid_to IS NULL";
+        const activeEdge = db.prepare(`SELECT id FROM edges
+          WHERE from_entity_id = ? AND relation_type = ? AND to_entity_id = ? ${temporalMembership}
+          ORDER BY valid_from DESC LIMIT 1`)
+          .get(...(EXCLUSIVE_TEMPORAL_RELATIONS.has(relation.type)
+            ? [fromId, relation.type, toId, validFrom, validFrom]
+            : [fromId, relation.type, toId]))                               ;
+        if (activeEdge?.id) {
+          duplicateRelations += 1;
+          const provenance = db.prepare(`INSERT OR IGNORE INTO edge_provenance(edge_id, episode_id, observed_at)
+            VALUES (?, ?, ?)`)
+            .run(activeEdge.id, episode.id, occurredAt);
+          provenanceLinks += Number(provenance.changes ?? 0);
+          continue;
+        }
+
+        const edgeId = stableId("edge", `${fromId}:${relation.type}:${toId}:${validFrom}`);
+        const nextTemporalEdge = EXCLUSIVE_TEMPORAL_RELATIONS.has(relation.type)
+          ? db.prepare(`SELECT valid_from FROM edges
+              WHERE from_entity_id = ? AND relation_type = ? AND valid_from > ?
+              ORDER BY valid_from ASC LIMIT 1`)
+            .get(fromId, relation.type, validFrom)
+          : undefined;
         const inserted = db.prepare(`INSERT OR IGNORE INTO edges(
           id, from_entity_id, relation_type, to_entity_id, valid_from, valid_to,
           episode_id, confidence, created_at
-        ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)`)
-          .run(edgeId, fromId, relation.type, toId, validFrom, episode.id, clampConfidence(relation.confidence), now);
-        relationsCreated += Number(inserted.changes ?? 0);
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(
+            edgeId,
+            fromId,
+            relation.type,
+            toId,
+            validFrom,
+            nextTemporalEdge?.valid_from ?? null,
+            episode.id,
+            clampConfidence(relation.confidence),
+            now,
+          );
+        const relationCreated = Number(inserted.changes ?? 0);
+        relationsCreated += relationCreated;
+        if (relationCreated === 0) duplicateRelations += 1;
+        const provenance = db.prepare(`INSERT OR IGNORE INTO edge_provenance(edge_id, episode_id, observed_at)
+          VALUES (?, ?, ?)`)
+          .run(edgeId, episode.id, occurredAt);
+        provenanceLinks += Number(provenance.changes ?? 0);
       }
       db.exec("COMMIT");
     } catch (error) {
       db.exec("ROLLBACK");
       throw error;
     }
-    return { episodeId: episode.id, idempotent: false, entitiesCreated, entityMerges, relationsCreated, temporalInvalidations };
+    return {
+      episodeId: episode.id,
+      idempotent: false,
+      entitiesCreated,
+      entityMerges,
+      relationsCreated,
+      duplicateRelations,
+      provenanceLinks,
+      temporalInvalidations,
+    };
   }
 
           adjacentEdges(db              , entityId        , asOf        , includeHistory         )            {
@@ -297,11 +497,16 @@ export class SqliteGraphProvider                          {
     return { hits: deduped, timing: { spawnMs: 0, searchMs: elapsed, totalMs: elapsed }, rawOutput: "" };
   }
 
-  async entityForAlias(alias        )                                 {
+  async entityForAlias(alias        , type         )                                 {
     const db = await this.database();
-    return db.prepare(`SELECT e.id, e.canonical_name, e.type FROM entity_aliases a
-      JOIN entities e ON e.id = a.entity_id WHERE a.alias_norm = ?`)
-      .get(normalizeEntityAlias(alias))                         ;
+    const rows = (type
+      ? db.prepare(`SELECT e.id, e.canonical_name, e.type FROM entity_aliases a
+          JOIN entities e ON e.id = a.entity_id WHERE a.alias_key = ?`)
+        .all(aliasKey(type, normalizeEntityAlias(alias)))
+      : db.prepare(`SELECT DISTINCT e.id, e.canonical_name, e.type FROM entity_aliases a
+          JOIN entities e ON e.id = a.entity_id WHERE a.alias_norm = ?`)
+        .all(normalizeEntityAlias(alias)))                          ;
+    return rows.length === 1 ? rows[0] : undefined;
   }
 
   async activeRelations(fromAlias        , type              )                                                                                {

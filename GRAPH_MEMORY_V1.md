@@ -1,8 +1,10 @@
 # Graph Memory v1
 
+> 2026-08-24 pre-launch status: v0.6.0 freezes Graph read work and keeps live Graph read/writer off. Writer safety, guarded administration, deterministic offline replay, and the pre-Graph Vector baseline are documented in [GRAPH_WRITER_PRELAUNCH.md](./GRAPH_WRITER_PRELAUNCH.md). Any older rollout text below that enables Graph read before data accumulation is superseded by that guide.
+
 ## 审计结论与工程取舍
 
-- 现有 `before_prompt_build`、`evaluateRecallDemand()`、BGE-M3 `memory_search`、DeepSeek query expansion 和 RRF 都能保留；Graph Memory 作为旁路加入，不需要重写 Active Recall。
+- 现有 `before_prompt_build`、`evaluateRecallDemand()`、BGE-M3 `memory_search` 和 RRF 都保留；Graph Memory 作为旁路加入，不重写 Active Recall。v0.5.1 已把 balanced 的 DeepSeek expansion 替换为 deterministic expansion，旧 LLM expansion 只作为 deep rescue。
 - 本机只有 Node 24，没有 Python 和 Docker。Graphiti 当前需要 Python 运行时以及 Neo4j/FalkorDB 等图后端，不适合作为 Windows 上的低风险首发依赖。
 - Node 24 自带 `node:sqlite`，因此 v1 实现 `GraphProvider` 抽象并先接插件自有的 `local-sqlite` provider。`graphiti`、`falkordb`、`neo4j` 是保留的配置值；选择它们会快速失败并回退 Vector，不会假装已接通。
 - 开发副本是 `workspace/plugins/active_recall`，OpenClaw 实际加载的是独立的 `extensions/active-recall`。发布时必须显式同步并分别验证。
@@ -112,11 +114,19 @@ Graph 默认关闭。启用写路径时，非内置插件还必须显式允许 `
 
 ## 渐进发布
 
-1. 保持 `graphMemory.enabled=false` 安装 v0.5.0，确认旧 40 个行为测试和配置校验不变。
+1. 保持 `graphMemory.enabled=false` 安装 v0.5.1，确认 deterministic recall、balanced 零 LLM invariant 和配置校验不变。
 2. 在测试会话启用 Graph，并配置 `hooks.allowConversationAccess=true`；先保留 `routeMode=vector` 验证后台 writer、幂等和 trace。
 3. 切到 `routeMode=auto`，用 `/recall graph ...` 和 `/recall hybrid ...` 做显式验证。
 4. 单独禁用 `active-memory` 做延迟 A/B；不要同时改多个变量。
 5. 检查 `memory/recall-traces.jsonl` 和 `memory/graph-memory/write-traces.jsonl` 后再扩大范围。
+
+### A/B 三组对照
+
+1. **A / old active-memory**：启用 `active-memory`，禁用 active-recall；记录端到端延迟、超时与命中相关性。
+2. **B / deterministic recall**：禁用 `active-memory`，启用 active-recall，保持 `graphMemory.enabled=false`；重点核验 balanced `llmCalls=0`。
+3. **C / deterministic recall + Graph**：保持 B，仅开启 `graphMemory.enabled=true` 和 `routeMode=auto`；只对 graph/hybrid route 计算 Graph 增量。
+
+每次只切一个变量并重启 Gateway；使用同一组 prompt、同一记忆快照，比较 p50/p90、timeout/fallback、quality pass、注入字符数及 graph 命中。不要同时运行 A 与 B/C，否则两个 `before_prompt_build` hook 会叠加，无法归因。
 
 回滚只需设置 `graphMemory.enabled=false`。SQLite、Profile JSON 和 episode Markdown 可以保留，不影响旧 Vector 读路径；不要在回滚时直接删除数据。
 
@@ -129,6 +139,7 @@ Recall trace 新增 route、Vector/Graph/Profile 延迟和命中数、Graph time
 - v1 的实体和关系抽取依赖一个短结构化 LLM 调用；没有 key 或抽取失败时只跳过该次写入，不影响回复。
 - Vector 写入通过受控 Markdown episode 和现有 memory manager `sync()` 进入 BGE-M3，而不是直接写 OpenClaw 的内部 SQLite。这样保持所有权边界，但索引完成时间取决于 memory manager。
 - SQLite 查询是进程内同步操作，无法在执行中被 JavaScript Promise 强制中断；v1 通过小图、索引、最多 4 hops 和默认 2 hops 控制查询量。将来数据量显著增长时可移到 worker 或外部 Graphiti provider。
+- `node:sqlite` 在首次真正打开 Graph 数据库时才动态导入；Graph 默认关闭时不会在插件加载阶段要求 SQLite 模块。启用 `local-sqlite` 仍要求 Node 22.5 或更高版本。
 - v1 仅把 `prefers` 设为排他时序关系。后续应基于真实数据为 `runs_on` 等关系增加显式 cardinality，而不是猜测并失效旧事实。
 - Alias resolution 是精确规范化匹配；`hg` 等短 alias 只有在被可靠抽取或人工写入时才合并。后续可增加受约束的 embedding candidate generation 和人工 merge queue。
 - 下一阶段可实现 Graphiti HTTP/Python sidecar provider、双时态（event time 与 ingestion time）、关系级 contradiction policy、离线重建和标注集上的 Hit@K/MRR/false-injection 评估。

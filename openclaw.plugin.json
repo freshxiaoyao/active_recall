@@ -1,7 +1,7 @@
 {
   "id": "active-recall",
   "name": "Active Recall",
-  "description": "On-demand hybrid Profile, Vector, and Temporal Graph Memory with a zero-LLM route gate, bounded retrieval, RRF fusion, and a non-blocking agent_end writer. Graph Memory is optional and defaults off.",
+  "description": "On-demand hybrid Profile, Vector, and Temporal Graph Memory with deterministic balanced retrieval, deep-only budgeted LLM rescue, RRF fusion, and a non-blocking agent_end writer. Graph Memory is optional and defaults off.",
   "activation": {
     "onCapabilities": ["hook"]
   },
@@ -34,7 +34,8 @@
           "apiKeyEnv": { "type": "string", "default": "DEEPSEEK_API_KEY" },
           "model": { "type": "string", "default": "deepseek-v4-flash" },
           "headers": { "type": "object" },
-          "timeoutMs": { "type": "number", "minimum": 500, "maximum": 30000, "default": 2500 },
+          "timeoutMs": { "type": "number", "minimum": 100, "maximum": 2500, "default": 2500, "description": "Hard AbortController timeout for deep-only LLM rescue" },
+          "minRemainingBudgetMs": { "type": "number", "minimum": 2500, "maximum": 60000, "default": 2750, "description": "Do not start LLM rescue unless at least this much total budget remains" },
           "maxOutputTokens": { "type": "number", "minimum": 50, "maximum": 4000, "default": 800 },
           "responseFormat": { "type": "string", "enum": ["json_object", "json_schema"], "default": "json_object" },
           "thinkingMode": { "type": "string", "enum": ["auto", "enabled", "disabled", "omit"], "default": "auto", "description": "auto disables thinking for the official DeepSeek endpoint and omits the field elsewhere" },
@@ -52,7 +53,7 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean", "default": true },
+          "enabled": { "type": "boolean", "default": false, "description": "Deprecated compatibility switch; uncertain demand uses a BGE topK=1 quality probe" },
           "model": { "type": "string", "description": "Defaults to expansion.model" },
           "timeoutMs": { "type": "number", "minimum": 200, "maximum": 5000, "default": 1800 },
           "maxOutputTokens": { "type": "number", "minimum": 50, "maximum": 500, "default": 160 }
@@ -136,11 +137,24 @@
             "additionalProperties": false,
             "properties": {
               "enabled": { "type": "boolean", "default": true },
+              "mode": { "type": "string", "enum": ["off", "dry-run", "shadow", "write"], "default": "off", "description": "Writer rollout mode. dry-run and shadow extract/validate only and never mutate Graph, Profile, or Vector stores." },
               "model": { "type": "string", "description": "Defaults to expansion.model" },
               "timeoutMs": { "type": "integer", "minimum": 500, "maximum": 30000, "default": 8000 },
               "maxOutputTokens": { "type": "integer", "minimum": 100, "maximum": 4000, "default": 1200 },
               "maxInputChars": { "type": "integer", "minimum": 1000, "maximum": 50000, "default": 12000 },
-              "traceFile": { "type": "string", "default": "memory/graph-memory/write-traces.jsonl" }
+              "traceFile": { "type": "string", "default": "memory/graph-memory/write-traces.jsonl" },
+              "sessionAllowlist": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [], "description": "Exact session keys or prefix patterns ending in *. Empty means all eligible non-internal sessions." },
+              "maxEntitiesPerTurn": { "type": "integer", "minimum": 1, "maximum": 100, "default": 12 },
+              "maxEdgesPerTurn": { "type": "integer", "minimum": 0, "maximum": 200, "default": 16 },
+              "maxEpisodesPerTurn": { "type": "integer", "minimum": 0, "maximum": 1, "default": 1 },
+              "circuitBreaker": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "failureThreshold": { "type": "integer", "minimum": 1, "maximum": 20, "default": 3 },
+                  "resetAfterMs": { "type": "integer", "minimum": 1000, "maximum": 86400000, "default": 300000 }
+                }
+              }
             }
           }
         }

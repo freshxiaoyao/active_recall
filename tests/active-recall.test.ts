@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { cleanPromptForSearch } from "../clean-prompt.js";
 import { readConfig } from "../config.js";
 import { evaluateRecallDemand, routeRecallQuery } from "../demand.js";
+import { buildDeterministicSearchRoutes, hasTemporalCue, normalizeRecallQuery } from "../deterministic-expansion.js";
 import { buildExpansionSearchRoutes, expandQuery, parseExpansionContent } from "../expansion.js";
 import { canonicalPath, fuseRoutes, isStrongSignal, passesQualityGate, successfulRoutes } from "../fusion.js";
 import activeRecallPlugin, { injectContext, isInternalSession, resolveRecallRoute, runRecall } from "../index.js";
@@ -86,7 +87,7 @@ test("on-demand trigger recognizes memory-dependent Chinese and English prompts"
   for (const prompt of fixtures) assert.equal(evaluateRecallDemand(prompt, trigger).decision, "yes", prompt);
 });
 
-test("vague continuation uses semantic fallback instead of forcing recall", () => {
+test("vague continuation enters the uncertain BGE probe path", () => {
   const trigger = readConfig({}).trigger;
   for (const prompt of ["帮我把这个方案落地", "继续优化这个插件", "Tune this current implementation"]) {
     assert.equal(evaluateRecallDemand(prompt, trigger).decision, "uncertain", prompt);
@@ -139,6 +140,17 @@ test("route gate selects graph and hybrid without an LLM", () => {
     { decision: "yes", route: "graph" },
   );
   assert.equal(evaluateRecallDemand("法国和德国有什么关系？", trigger).decision, "no");
+});
+
+test("temporal cues survive routing and are stripped only during retrieval normalization", () => {
+  const input = "/recall 我以前偏好什么模型，现在后来改成什么了？";
+  const demand = evaluateRecallDemand(input, readConfig({}).trigger);
+  assert.equal(hasTemporalCue(demand.query), true);
+  assert.equal(demand.route, "graph");
+  const normalized = normalizeRecallQuery(demand.query);
+  assert.equal(hasTemporalCue(normalized), false);
+  assert.match(normalized, /偏好.*模型.*改成/);
+  assert.ok(buildDeterministicSearchRoutes(input, "deep").length <= 3);
 });
 
 test("RRF ranks a repeated result before one literal-only result", () => {
@@ -402,7 +414,7 @@ test("structured helper calls disable DeepSeek thinking and accept text content 
         choices: [{ finish_reason: "stop", message: { content: [{ type: "text", text: content }] } }],
       }), { status: 200 });
     };
-    const config = readConfig({});
+    const config = readConfig({ semanticGate: { enabled: true } });
     const gate = await evaluateSemanticRecall("continue this project", config.expansion, config.semanticGate);
     const expansion = await expandQuery("continue this project", config.expansion, 1);
     assert.equal(gate.status, "structured_ok");
@@ -437,7 +449,7 @@ test("reasoning-only payload failures expose safe response-shape diagnostics", a
     globalThis.fetch = async () => new Response(JSON.stringify({
       choices: [{ finish_reason: "length", message: { content: null, reasoning_content: "private reasoning omitted" } }],
     }), { status: 200 });
-    const config = readConfig({});
+    const config = readConfig({ semanticGate: { enabled: true } });
     const gate = await evaluateSemanticRecall("continue this project", config.expansion, config.semanticGate);
     const expansion = await expandQuery("continue this project", config.expansion, 1);
     assert.equal(gate.status, "payload_fail");
@@ -469,7 +481,7 @@ test("semantic gate timeout is short and fail-open", async () => {
   const originalFetch = globalThis.fetch;
   try {
     globalThis.fetch = async () => { throw new DOMException("timed out", "TimeoutError"); };
-    const config = readConfig({});
+    const config = readConfig({ semanticGate: { enabled: true } });
     const attempt = await evaluateSemanticRecall("continue this project", config.expansion, config.semanticGate);
     assert.equal(attempt.status, "timeout");
     assert.equal(attempt.result, null);
@@ -478,17 +490,17 @@ test("semantic gate timeout is short and fail-open", async () => {
   }
 });
 
-test("runRecall performs zero search and zero semantic call for ordinary knowledge", async () => {
+test("runRecall performs zero search and zero LLM call for ordinary knowledge", async () => {
   let searches = 0;
-  let gates = 0;
+  let expansions = 0;
   const config = readConfig({ trace: { enabled: false } });
   const result = await runRecall(pluginApi, { prompt: "什么是 RRF？" }, recallCtx, config, {
     search: async () => { searches += 1; throw new Error("must not search"); },
-    semanticGate: async () => { gates += 1; throw new Error("must not gate"); },
+    expand: async () => { expansions += 1; throw new Error("must not expand"); },
   });
   assert.equal(result, undefined);
   assert.equal(searches, 0);
-  assert.equal(gates, 0);
+  assert.equal(expansions, 0);
 });
 
 test("runRecall skips expansion for a strong literal hit", async () => {
@@ -504,35 +516,49 @@ test("runRecall skips expansion for a strong literal hit", async () => {
   assert.equal(expansions, 0);
 });
 
-test("runRecall uses semantic gate only for uncertain prompts", async () => {
-  let gates = 0;
+test("uncertain demand uses a scored BGE topK=1 probe, not presence-only or an LLM", async () => {
+  let searches = 0;
+  let expansions = 0;
   const config = readConfig({ trace: { enabled: false } });
-  const result = await runRecall(pluginApi, { prompt: "继续优化这个插件" }, recallCtx, config, {
-    semanticGate: async () => {
-      gates += 1;
-      return { result: { recall: true, depth: "literal", reason: "depends on prior plugin work" }, status: "structured_ok", parseMode: "strict" };
+  const rejected = await runRecall(pluginApi, { prompt: "Tune this current implementation" }, recallCtx, config, {
+    search: async (_query, options) => {
+      searches += 1;
+      assert.equal(options.maxResults, 1);
+      return searchResult([{ path: "memory/plugin.md", score: 0.6 }]);
     },
-    search: async () => searchResult([{ path: "memory/plugin.md", score: 0.9 }]),
+    expand: async () => { expansions += 1; throw new Error("must not expand"); },
   });
-  assert.equal(gates, 1);
-  assert.ok(result?.prependContext.includes("memory/plugin.md"));
+  assert.equal(rejected, undefined);
+  assert.equal(searches, 1);
+  assert.equal(expansions, 0);
+
+  const accepted = await runRecall(pluginApi, { prompt: "Tune this current implementation" }, recallCtx, config, {
+    search: async () => searchResult([{ path: "memory/plugin.md", score: 0.9 }]),
+    expand: async () => { expansions += 1; throw new Error("must not expand"); },
+  });
+  assert.ok(accepted?.prependContext.includes("memory/plugin.md"));
+  assert.equal(expansions, 0);
 });
 
-test("runRecall falls back to literal immediately when expansion times out", async () => {
+test("deep explicit rescue timeout leaves deterministic retrieval fail-open", async () => {
   let searches = 0;
-  const config = readConfig({ trace: { enabled: false } });
-  const result = await runRecall(pluginApi, { prompt: "/recall project decision" }, recallCtx, config, {
-    search: async () => { searches += 1; return searchResult([{ path: "memory/decision.md", score: 0.7 }]); },
+  const config = readConfig({ profile: "deep", maxTotalMs: 10000, trace: { enabled: false } });
+  const result = await runRecall(pluginApi, { prompt: "/recall deep project decision" }, recallCtx, config, {
+    search: async () => {
+      searches += 1;
+      return searches === 1 ? searchResult([{ path: "memory/decision.md", score: 0.6 }]) : searchResult([]);
+    },
     expand: async () => ({
       result: null, status: "timeout", diagnostics: { parseMode: "none", contentChars: 0, failureReason: "timeout" },
     }),
   });
-  assert.equal(searches, 1);
-  assert.ok(result?.prependContext.includes("memory/decision.md"));
+  assert.ok(searches >= 2);
+  assert.equal(result, undefined);
 });
 
-test("runRecall admits a medium raw hit only after expansion route consensus", async () => {
+test("balanced admits a medium raw hit only after deterministic route consensus with zero LLM calls", async () => {
   let searches = 0;
+  let expansions = 0;
   const config = readConfig({ trace: { enabled: false } });
   const result = await runRecall(pluginApi, { prompt: "/recall project decision" }, recallCtx, config, {
     search: async () => {
@@ -541,14 +567,64 @@ test("runRecall admits a medium raw hit only after expansion route consensus", a
         ? searchResult([{ path: "memory/decision.md", score: 0.6 }])
         : searchResult([{ path: "memory/decision.md", score: 0.58 }]);
     },
-    expand: async () => ({
-      result: { rewrite: "approval project decision", associations: [] },
-      status: "structured_ok",
-      diagnostics: { parseMode: "strict", contentChars: 64 },
-    }),
+    expand: async () => { expansions += 1; throw new Error("balanced must never call an LLM"); },
   });
   assert.equal(searches, 2);
+  assert.equal(expansions, 0);
   assert.ok(result?.prependContext.includes("memory/decision.md"));
+});
+
+test("LLM rescue requires deep, explicit intent, poor quality, and sufficient remaining budget", async () => {
+  let expansions = 0;
+  const config = readConfig({ profile: "deep", maxTotalMs: 10000, trace: { enabled: false } });
+  const result = await runRecall(pluginApi, { prompt: "/recall deep project decision" }, recallCtx, config, {
+    search: async (query) => query === "approval decision archive"
+      ? searchResult([{ path: "memory/rescued.md", score: 0.9 }])
+      : searchResult([]),
+    expand: async () => {
+      expansions += 1;
+      return {
+        result: { rewrite: "approval decision archive", associations: [] },
+        status: "structured_ok",
+        diagnostics: { parseMode: "strict", contentChars: 48 },
+      };
+    },
+  });
+  assert.equal(expansions, 1);
+  assert.match(result?.prependContext ?? "", /memory\/rescued\.md/);
+
+  expansions = 0;
+  await runRecall(pluginApi, { prompt: "What did we decide last time about human-gate?" }, recallCtx, config, {
+    search: async () => searchResult([]),
+    expand: async () => { expansions += 1; throw new Error("non-explicit intent must not rescue"); },
+  });
+  assert.equal(expansions, 0);
+
+  const exhausted = readConfig({ profile: "deep", maxTotalMs: 100, expansion: { minRemainingBudgetMs: 2750 }, trace: { enabled: false } });
+  await runRecall(pluginApi, { prompt: "/recall deep project decision" }, recallCtx, exhausted, {
+    search: async () => searchResult([]),
+    expand: async () => { expansions += 1; throw new Error("insufficient budget must not send"); },
+  });
+  assert.equal(expansions, 0);
+});
+
+test("LLM rescue timeout aborts the underlying fetch with AbortController", async () => {
+  const originalFetch = globalThis.fetch;
+  let observedSignal: AbortSignal | undefined;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      observedSignal = init?.signal ?? undefined;
+      return await new Promise((_resolve, reject) => {
+        observedSignal?.addEventListener("abort", () => reject(observedSignal?.reason), { once: true });
+      });
+    };
+    const config = readConfig({ expansion: { timeoutMs: 20 } });
+    const attempt = await expandQuery("project decision", config.expansion, 1);
+    assert.equal(attempt.status, "timeout");
+    assert.equal(observedSignal?.aborted, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("runRecall keeps fail-open when literal search throws", async () => {
@@ -602,6 +678,9 @@ test("runRecall trace includes phase latency and separated rank metrics", async 
     assert.equal(typeof top.rrfScore, "number");
     assert.equal(typeof top.finalRankScore, "number");
     assert.equal(top.finalRankScore, top.finalScore);
+    assert.equal(record.llmCalls, 0);
+    assert.equal(record.balancedLlmInvariant, true);
+    assert.equal(typeof record.deterministicQueries, "number");
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -637,8 +716,10 @@ test("quality-tuned defaults stay aligned", () => {
   assert.equal(config.maxTotalMs, 5000);
   assert.equal(config.searchTimeoutMs, 2200);
   assert.equal(config.expansion.timeoutMs, 2500);
+  assert.equal(config.expansion.minRemainingBudgetMs, 2750);
   assert.equal(config.expansion.thinkingMode, "auto");
   assert.equal(config.semanticGate.timeoutMs, 1800);
+  assert.equal(config.semanticGate.enabled, false);
   assert.equal(config.strongSignal.sources.sessions.minScore, 0.92);
   assert.equal(config.strongSignal.sources.sessions.gap, 0.2);
   assert.equal(config.rrf.k, 20);
@@ -649,7 +730,7 @@ test("quality-tuned defaults stay aligned", () => {
   assert.equal(canonicalPath("memory\\Example.md"), canonicalPath("memory/Example.md"));
 });
 
-test("agent_end writer hook is registered only when graph memory is enabled", () => {
+test("agent_end writer hook follows writer rollout mode independently from Graph read", () => {
   const disabledEvents: string[] = [];
   activeRecallPlugin.register({ pluginConfig: {}, on: (event: string) => { disabledEvents.push(event); } } as never);
   assert.deepEqual(disabledEvents, ["before_prompt_build"]);
@@ -657,6 +738,13 @@ test("agent_end writer hook is registered only when graph memory is enabled", ()
   const enabledEvents: string[] = [];
   activeRecallPlugin.register({ pluginConfig: { graphMemory: { enabled: true } }, on: (event: string) => { enabledEvents.push(event); } } as never);
   assert.deepEqual(enabledEvents, ["before_prompt_build", "agent_end"]);
+
+  const dryRunEvents: string[] = [];
+  activeRecallPlugin.register({
+    pluginConfig: { graphMemory: { enabled: false, writer: { mode: "dry-run" } } },
+    on: (event: string) => { dryRunEvents.push(event); },
+  } as never);
+  assert.deepEqual(dryRunEvents, ["before_prompt_build", "agent_end"]);
 });
 
 test("legacy quality threshold and expansion model remain backward compatible", () => {

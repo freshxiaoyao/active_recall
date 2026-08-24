@@ -1,0 +1,168 @@
+#!/usr/bin/env node
+
+import { resolve } from "node:path";
+import { GraphAdmin, readGraphSnapshot } from "../graph-admin.js";
+
+function usage() {
+  return `Graph Memory administrative CLI
+
+Read-only:
+  graph-admin export --db <sqlite> --out <snapshot.json>
+  graph-admin inspect --db <sqlite> --entity <alias-or-id>
+  graph-admin merges --db <sqlite> [--limit 20]
+  graph-admin invalidations --db <sqlite> [--limit 20]
+
+Destructive (dry-run unless --apply is supplied):
+  graph-admin delete-episode --db <sqlite> --episode <id>
+  graph-admin delete-session --db <sqlite> --session <sessionKey>
+  graph-admin delete-time --db <sqlite> --from <ISO> --to <ISO>
+  graph-admin clear --db <sqlite>
+  graph-admin import --db <sqlite> --input <snapshot.json>
+  graph-admin rebuild-stored --db <sqlite>
+  graph-admin rebuild-vector --db <sqlite> --vector-dir <directory>
+
+Every destructive apply requires BOTH:
+  --apply --expected-db <exact-absolute-path> --confirm <dry-run-token>
+
+Run the command without --apply first; it prints the exact confirmation token.`;
+}
+
+function parseArgs(values) {
+  const parsed = { _: [] };
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (!value.startsWith("--")) {
+      parsed._.push(value);
+      continue;
+    }
+    const key = value.slice(2);
+    if (key === "apply" || key === "help") {
+      parsed[key] = true;
+      continue;
+    }
+    const next = values[index + 1];
+    if (!next || next.startsWith("--")) throw new Error(`missing value for --${key}`);
+    parsed[key] = next;
+    index += 1;
+  }
+  return parsed;
+}
+
+function required(args, key) {
+  const value = args[key];
+  if (typeof value !== "string" || !value.trim()) throw new Error(`--${key} is required`);
+  return value.trim();
+}
+
+function normalizePath(value) {
+  const absolute = resolve(value);
+  return process.platform === "win32" ? absolute.toLocaleLowerCase("en-US") : absolute;
+}
+
+function mutationGuard(args, admin, operation, target) {
+  const confirmationToken = admin.mutationToken(operation, target);
+  if (!args.apply) {
+    return {
+      dryRun: true,
+      operation,
+      target,
+      database: admin.file,
+      requiredExpectedDatabasePath: admin.file,
+      confirmationToken,
+      note: "No database changes were made. Repeat with --apply, exact --expected-db, and this --confirm token.",
+    };
+  }
+  return {
+    expectedDatabasePath: required(args, "expected-db"),
+    confirmationToken: required(args, "confirm"),
+  };
+}
+
+function print(value) {
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const command = args._[0];
+  if (!command || args.help) {
+    process.stdout.write(`${usage()}\n`);
+    return;
+  }
+  const database = required(args, "db");
+  const admin = new GraphAdmin(database, process.cwd());
+  try {
+    if (command === "export") {
+      const output = required(args, "out");
+      const snapshot = await admin.exportTo(output);
+      print({ status: "ok", database: admin.file, output: resolve(output), tables: Object.fromEntries(Object.entries(snapshot.tables).map(([name, rows]) => [name, rows.length])) });
+      return;
+    }
+    if (command === "inspect") {
+      print(await admin.inspectEntity(required(args, "entity")));
+      return;
+    }
+    if (command === "merges") {
+      print(await admin.recentEntityMerges(Number(args.limit ?? 20)));
+      return;
+    }
+    if (command === "invalidations") {
+      print(await admin.recentTemporalInvalidations(Number(args.limit ?? 20)));
+      return;
+    }
+
+    let operation;
+    let target;
+    let execute;
+    if (command === "delete-episode") {
+      operation = command;
+      target = required(args, "episode");
+      execute = (guard) => admin.deleteByEpisode(target, guard);
+    } else if (command === "delete-session") {
+      operation = command;
+      target = required(args, "session");
+      execute = (guard) => admin.deleteBySession(target, guard);
+    } else if (command === "delete-time") {
+      operation = command;
+      const from = new Date(required(args, "from"));
+      const to = new Date(required(args, "to"));
+      if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) throw new Error("--from and --to must be ISO date/times");
+      target = `${from.toISOString()}..${to.toISOString()}`;
+      execute = (guard) => admin.deleteByTimeRange(from.toISOString(), to.toISOString(), guard);
+    } else if (command === "clear") {
+      operation = command;
+      target = "all";
+      execute = (guard) => admin.clearGraph(guard);
+    } else if (command === "import") {
+      operation = command;
+      target = "snapshot";
+      const snapshotFile = required(args, "input");
+      execute = async (guard) => admin.importGraph(await readGraphSnapshot(snapshotFile), guard);
+    } else if (command === "rebuild-stored") {
+      operation = command;
+      target = "stored-episodes";
+      execute = (guard) => admin.rebuildFromStoredEpisodes(guard);
+    } else if (command === "rebuild-vector") {
+      operation = command;
+      const vectorDirectory = required(args, "vector-dir");
+      target = normalizePath(vectorDirectory);
+      execute = (guard) => admin.rebuildFromVectorDirectory(vectorDirectory, guard);
+    } else {
+      throw new Error(`unknown command: ${command}\n\n${usage()}`);
+    }
+
+    const guard = mutationGuard(args, admin, operation, target);
+    if (guard.dryRun) {
+      print(guard);
+      return;
+    }
+    print(await execute(guard));
+  } finally {
+    admin.close();
+  }
+}
+
+main().catch((error) => {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+});

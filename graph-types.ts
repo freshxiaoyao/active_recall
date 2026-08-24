@@ -47,6 +47,8 @@ export interface GraphWriteResult {
   entitiesCreated: number;
   entityMerges: number;
   relationsCreated: number;
+  duplicateRelations: number;
+  provenanceLinks: number;
   temporalInvalidations: number;
 }
 

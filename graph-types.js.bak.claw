@@ -1,0 +1,75 @@
+
+
+export const ENTITY_TYPES = [
+  "User", "Project", "Tool", "Model", "Device", "Software",
+  "Preference", "Goal", "Organization", "Platform",
+]         ;
+
+export const RELATION_TYPES = [
+  "uses", "develops", "prefers", "depends_on", "maintained_with",
+  "runs_on", "published_on", "owns", "related_to", "works_on",
+  "installed_on", "targets",
+]         ;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+export function isEntityType(value         )                      {
+  return typeof value === "string" && (ENTITY_TYPES                     ).includes(value);
+}
+
+export function isRelationType(value         )                        {
+  return typeof value === "string" && (RELATION_TYPES                     ).includes(value);
+}
+
+
+//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active_recall\graph-types.ts

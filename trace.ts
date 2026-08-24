@@ -14,7 +14,7 @@ export interface TraceRecord {
   ts: string;
   session: string;
   profile: string;
-  status: "ok" | "partial" | "timeout" | "fail_open" | "no_result" | "low_quality" | "skipped_not_needed" | "skipped_semantic_no";
+  status: "ok" | "partial" | "timeout" | "fail_open" | "no_result" | "low_quality" | "skipped_not_needed" | "skipped_semantic_no" | "skipped_probe_no";
   elapsedMs: number;
   totalMs: number;
   literalMs: number;
@@ -36,11 +36,18 @@ export interface TraceRecord {
   graphHits?: number;
   profileHits?: number;
   gateDecision: "yes" | "no" | "uncertain";
-  gateStatus?: SemanticGateStatus | "not_run";
+  gateStatus?: SemanticGateStatus | "not_run" | "bge_probe_pass" | "bge_probe_fail" | "bge_probe_error";
   gateReason?: string;
   gateFinishReason?: string;
   gateContentType?: string;
   gateHasReasoningContent?: boolean;
+  probeTopScore?: number;
+  probePassed?: boolean;
+  deterministicQueries?: number;
+  llmCalls?: number;
+  balancedLlmInvariant?: boolean;
+  rescueStatus?: "not_run" | "skipped_not_deep" | "skipped_intent" | "skipped_quality" | "skipped_budget" | ExpansionStatus;
+  rescueRemainingMs?: number;
   expansion: ExpansionStatus | "skipped_strong" | "skipped_speed" | "skipped_literal" | "not_run";
   expansionParseMode?: ExpansionParseMode;
   expansionFinishReason?: string;

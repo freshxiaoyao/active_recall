@@ -1,12 +1,15 @@
 import type { GraphEntityInput } from "./graph-types.js";
 
-/** Exact alias resolution uses a punctuation-insensitive Unicode key. */
+/** Human names are punctuation-insensitive; technical identifiers retain structural punctuation. */
 export function normalizeEntityAlias(value: string): string {
-  return value
-    .normalize("NFKC")
-    .toLocaleLowerCase()
-    .replace(/[\s\-_./\\:：'"“”‘’()[\]{}]+/g, "")
-    .trim();
+  const folded = value.normalize("NFKC").toLocaleLowerCase().trim();
+  const technicalIdentifier = /[\\/]|^@[a-z0-9_.-]+\/[a-z0-9_.-]+$|^[a-z][a-z0-9+.-]*:|\.[a-z][a-z0-9]{0,11}$/i.test(folded);
+  if (technicalIdentifier) {
+    return folded
+      .replace(/\\/g, "/")
+      .replace(/[\s'"“”‘’()[\]{}]+/gu, "");
+  }
+  return folded.replace(/[\s\-_./\\:：'"“”‘’()[\]{}]+/gu, "");
 }
 
 export function entityAliases(entity: GraphEntityInput): Array<{ alias: string; normalized: string }> {

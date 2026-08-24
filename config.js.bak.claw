@@ -68,6 +68,33 @@
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 const profileBudgets                                = {
   speed: 400,
   balanced: 800,
@@ -108,6 +135,14 @@ function thinkingModeValue(value         )               {
   return value === "enabled" || value === "disabled" || value === "omit" ? value : "auto";
 }
 
+function graphProviderValue(value         )                      {
+  return value === "graphiti" || value === "falkordb" || value === "neo4j" ? value : "local-sqlite";
+}
+
+function graphRouteModeValue(value         )                 {
+  return value === "vector" || value === "graph" || value === "hybrid" ? value : "auto";
+}
+
 function stringArray(value         , fallback          )           {
   if (!Array.isArray(value)) return [...fallback];
   const output = value
@@ -143,6 +178,8 @@ export function readConfig(pluginConfig         )               {
   const strongSources = record(strongSignal.sources);
   const qualityGate = record(raw.qualityGate);
   const semanticGate = record(raw.semanticGate);
+  const graphMemory = record(raw.graphMemory);
+  const graphWriter = record(graphMemory.writer);
   const rrf = record(raw.rrf);
   const trace = record(raw.trace);
 
@@ -181,6 +218,29 @@ export function readConfig(pluginConfig         )               {
       model: stringValue(semanticGate.model, stringValue(expansion.model, "deepseek-v4-flash")),
       timeoutMs: numberValue(semanticGate.timeoutMs, 1800),
       maxOutputTokens: numberValue(semanticGate.maxOutputTokens, 160),
+    },
+    graphMemory: {
+      enabled: booleanValue(graphMemory.enabled, false),
+      provider: graphProviderValue(graphMemory.provider),
+      file: stringValue(graphMemory.file, "memory/graph-memory/graph-memory-v1.sqlite"),
+      profileFile: stringValue(graphMemory.profileFile, "memory/profile-memory.json"),
+      vectorDir: stringValue(graphMemory.vectorDir, "memory/graph-memory/episodes"),
+      readTimeoutMs: numberValue(graphMemory.readTimeoutMs, 120),
+      writeTimeoutMs: numberValue(graphMemory.writeTimeoutMs, 12000),
+      routeMode: graphRouteModeValue(graphMemory.routeMode),
+      maxGraphResults: Math.max(1, Math.round(numberValue(graphMemory.maxGraphResults, 4))),
+      maxHops: Math.max(1, Math.min(4, Math.round(numberValue(graphMemory.maxHops, 2)))),
+      profileBudget: numberValue(graphMemory.profileBudget, 160),
+      vectorBudget: numberValue(graphMemory.vectorBudget, 600),
+      graphBudget: numberValue(graphMemory.graphBudget, 300),
+      writer: {
+        enabled: booleanValue(graphWriter.enabled, true),
+        model: stringValue(graphWriter.model, stringValue(expansion.model, "deepseek-v4-flash")),
+        timeoutMs: numberValue(graphWriter.timeoutMs, 8000),
+        maxOutputTokens: numberValue(graphWriter.maxOutputTokens, 1200),
+        maxInputChars: numberValue(graphWriter.maxInputChars, 12000),
+        traceFile: stringValue(graphWriter.traceFile, "memory/graph-memory/write-traces.jsonl"),
+      },
     },
     strongSignal: (() => {
       const minScore = numberValue(strongSignal.minScore, 0.85);
