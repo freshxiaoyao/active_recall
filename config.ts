@@ -6,6 +6,7 @@ export type ThinkingMode = "auto" | "enabled" | "disabled" | "omit";
 export type GraphMemoryProvider = "local-sqlite" | "graphiti" | "falkordb" | "neo4j";
 export type GraphRouteMode = "auto" | "vector" | "graph" | "hybrid";
 export type GraphWriterMode = "off" | "dry-run" | "shadow" | "write";
+export type RetrievalMode = "standalone" | "adapter";
 
 export interface RecallTriggerConfig {
   mode: RecallTriggerMode;
@@ -74,6 +75,7 @@ export interface GraphMemoryConfig {
 
 export interface RecallConfig {
   enabled: boolean;
+  retrievalMode: RetrievalMode;
   agents: string[];
   skipSystemEvents: boolean;
   trigger: RecallTriggerConfig;
@@ -160,6 +162,10 @@ function graphWriterModeValue(value: unknown, fallback: GraphWriterMode): GraphW
     : fallback;
 }
 
+function retrievalModeValue(value: unknown): RetrievalMode {
+  return value === "adapter" ? "adapter" : "standalone";
+}
+
 function stringArray(value: unknown, fallback: string[]): string[] {
   if (!Array.isArray(value)) return [...fallback];
   const output = value
@@ -203,6 +209,7 @@ export function readConfig(pluginConfig: unknown): RecallConfig {
 
   return {
     enabled: booleanValue(raw.enabled, true),
+    retrievalMode: retrievalModeValue(raw.retrievalMode),
     agents: Array.isArray(raw.agents) && raw.agents.every((item) => typeof item === "string")
       ? raw.agents as string[]
       : ["main"],

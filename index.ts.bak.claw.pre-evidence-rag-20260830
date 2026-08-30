@@ -7,11 +7,6 @@ import { fuseRoutes, isStrongSignal, successfulRoutes } from "./fusion.js";
 import { createGraphProvider } from "./graph-provider.js";
 import { effectiveWriterMode, enqueueMemoryWrite } from "./memory-writer.js";
 import { ProfileMemoryStore } from "./profile-memory.js";
-import {
-  LOCAL_RETRIEVER_API_VERSION,
-  publishLocalRetriever,
-  unpublishLocalRetriever,
-} from "./local-retriever.js";
 import { isInternalSession } from "./session-guard.js";
 import { memorySearch } from "./search.js";
 import { writeTrace } from "./trace.js";
@@ -20,7 +15,6 @@ import type { RecallTriggerReason } from "./demand.js";
 import type { ExpansionDiagnostics, ExpansionStatus } from "./expansion.js";
 import type { SearchRoute } from "./fusion.js";
 import type { RecallRoute } from "./graph-types.js";
-import type { LocalRecallEvidence, LocalRecallPlan, LocalRecallResult, LocalRetrieverProvider } from "./local-retriever.js";
 import type { SearchResult } from "./search.js";
 import type { TraceRecord } from "./trace.js";
 
@@ -30,7 +24,6 @@ interface PluginApi {
   logger?: { error?: (message: string) => void; warn?: (message: string) => void };
   on(event: "before_prompt_build", handler: (event: unknown, ctx: RecallCtx) => Promise<{ prependContext: string } | undefined>, options: { priority: number }): void;
   on(event: "agent_end", handler: (event: AgentEndEvent, ctx: RecallCtx) => void, options?: { timeoutMs?: number }): void;
-  registerService?(service: { id: string; start: () => void | Promise<void>; stop?: () => void | Promise<void> }): void;
 }
 
 interface PromptEvent {
@@ -81,7 +74,6 @@ interface LayerBudgets {
 interface InjectionResult {
   context?: string;
   layerChars: Record<"profile" | "vector" | "graph", number>;
-  selectedHits: ReturnType<typeof fuseRoutes>;
 }
 
 function hitLayer(source: string): keyof LayerBudgets {
@@ -96,7 +88,6 @@ function buildInjectedContext(hits: ReturnType<typeof fuseRoutes>, budget: numbe
   const maxChars = Math.max(0, budget * 4);
   const limits: LayerBudgets = layerBudgets ?? { profile: budget, vector: budget, graph: budget };
   const layerChars = { profile: 0, vector: 0, graph: 0 };
-  const selectedHits = [] as ReturnType<typeof fuseRoutes>;
   let output = prefix;
   for (const hit of hits) {
     const layer = hitLayer(hit.source);
@@ -106,9 +97,8 @@ function buildInjectedContext(hits: ReturnType<typeof fuseRoutes>, budget: numbe
     if (output.length + line.length + suffix.length > maxChars) break;
     output += line;
     layerChars[layer] += line.length;
-    selectedHits.push(hit);
   }
-  return { context: output === prefix ? undefined : `${output}${suffix}`, layerChars, selectedHits };
+  return { context: output === prefix ? undefined : `${output}${suffix}`, layerChars };
 }
 
 function injectContext(hits: ReturnType<typeof fuseRoutes>, budget: number, layerBudgets?: LayerBudgets): string | undefined {
@@ -174,39 +164,11 @@ interface PhaseMetrics {
   profileMs: number;
 }
 
-export interface RecallDependencies {
+interface RecallDependencies {
   search: typeof memorySearch;
   expand: typeof expandQuery;
   graphSearch: (query: string, config: RecallConfig, ctx: RecallCtx) => Promise<SearchResult>;
   profileSearch: (query: string, config: RecallConfig, ctx: RecallCtx) => Promise<SearchResult>;
-  onComplete?: (result: LocalRecallResult) => void;
-}
-
-function asLocalEvidence(hit: ReturnType<typeof fuseRoutes>[number]): LocalRecallEvidence {
-  const { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, finalRankScore, finalScore, routes, occurrences } = hit;
-  return { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, finalRankScore, finalScore, routes, occurrences };
-}
-
-function emptyLocalResult(reason: string, metrics: PhaseMetrics, totalMs = 0): LocalRecallResult {
-  return {
-    schemaVersion: LOCAL_RETRIEVER_API_VERSION,
-    status: "skipped_guard",
-    decision: "no",
-    reason,
-    depth: "none",
-    routeDecision: "none",
-    rankedHits: [],
-    selectedHits: [],
-    diagnostics: {
-      totalMs,
-      ...metrics,
-      vectorHits: 0,
-      graphHits: 0,
-      profileHits: 0,
-      deterministicQueries: 0,
-      llmCalls: 0,
-    },
-  };
 }
 
 async function defaultGraphSearch(query: string, config: RecallConfig, ctx: RecallCtx): Promise<SearchResult> {
@@ -229,68 +191,6 @@ export function resolveRecallRoute(route: RecallRoute, config: RecallConfig): Re
   return config.graphMemory.routeMode === "auto" ? route : config.graphMemory.routeMode;
 }
 
-interface LocalPlanState {
-  rawPrompt: string;
-  cleaned: string;
-  agent: string;
-  session: string;
-  guardReason?: string;
-  demand?: ReturnType<typeof evaluateRecallDemand>;
-  plan: LocalRecallPlan;
-}
-
-function resolveLocalPlanState(event: unknown, ctx: RecallCtx, config: RecallConfig): LocalPlanState {
-  const rawPrompt = promptText(event);
-  const cleaned = cleanPromptForSearch(rawPrompt);
-  const agent = agentId(ctx);
-  const session = sessionKey(ctx);
-  const guardReason = !cleaned
-    ? "empty_prompt"
-    : isInternalSession(session)
-      ? "internal_session"
-      : config.skipSystemEvents && isSystemEventPrompt(rawPrompt)
-        ? "system_event"
-        : !config.agents.includes(agent)
-          ? "agent_filtered"
-          : undefined;
-  if (guardReason) {
-    return {
-      rawPrompt,
-      cleaned,
-      agent,
-      session,
-      guardReason,
-      plan: {
-        schemaVersion: LOCAL_RETRIEVER_API_VERSION,
-        decision: "no",
-        reason: guardReason,
-        depth: "none",
-        routeDecision: "none",
-      },
-    };
-  }
-  const demand = evaluateRecallDemand(cleaned, config.trigger);
-  const noRecall = demand.decision === "no";
-  return {
-    rawPrompt,
-    cleaned,
-    agent,
-    session,
-    demand,
-    plan: {
-      schemaVersion: LOCAL_RETRIEVER_API_VERSION,
-      decision: demand.decision,
-      reason: demand.reason,
-      depth: noRecall ? "none" : demand.depth ?? depthForProfile(config.profile),
-      routeDecision: noRecall ? "none" : resolveRecallRoute(demand.route, config),
-    },
-  };
-}
-
-export function planLocalRecall(event: unknown, ctx: RecallCtx, config: RecallConfig): LocalRecallPlan {
-  return resolveLocalPlanState(event, ctx, config).plan;
-}
-
 async function runRecall(
   api: PluginApi,
   event: unknown,
@@ -303,24 +203,18 @@ async function runRecall(
     expand: dependencyOverrides.expand ?? expandQuery,
     graphSearch: dependencyOverrides.graphSearch ?? defaultGraphSearch,
     profileSearch: dependencyOverrides.profileSearch ?? defaultProfileSearch,
-    onComplete: dependencyOverrides.onComplete,
   };
   const startedAt = performance.now();
   const metrics: PhaseMetrics = { literalMs: 0, gateMs: 0, expansionMs: 0, searchMs: 0, fusionMs: 0, vectorMs: 0, graphMs: 0, profileMs: 0 };
-  const localPlan = resolveLocalPlanState(event, ctx, config);
-  const { rawPrompt, cleaned, agent, session } = localPlan;
-  if (localPlan.guardReason) {
-    try {
-      dependencies.onComplete?.(emptyLocalResult(localPlan.guardReason, metrics, Math.round(performance.now() - startedAt)));
-    } catch (error) {
-      api.logger?.warn?.(`active-recall adapter capture failed: ${String(error)}`);
-    }
-    return undefined;
-  }
+  const rawPrompt = promptText(event);
+  const cleaned = cleanPromptForSearch(rawPrompt);
+  const agent = agentId(ctx);
+  const session = sessionKey(ctx);
+  if (!cleaned || isInternalSession(session) || (config.skipSystemEvents && isSystemEventPrompt(rawPrompt)) || !config.agents.includes(agent)) return undefined;
 
-  const demand = localPlan.demand as ReturnType<typeof evaluateRecallDemand>;
-  let routeDecision = localPlan.plan.routeDecision;
-  let depth: RecallDepth = localPlan.plan.depth;
+  const demand = evaluateRecallDemand(cleaned, config.trigger);
+  let routeDecision = resolveRecallRoute(demand.route, config);
+  let depth: RecallDepth = demand.depth ?? depthForProfile(config.profile);
   let gateStatus: NonNullable<TraceRecord["gateStatus"]> = "not_run";
   let gateReason = demand.reason;
   let gateFinishReason: string | undefined;
@@ -332,7 +226,6 @@ async function runRecall(
   let fused = [] as ReturnType<typeof fuseRoutes>;
   let prependContext: string | undefined;
   let injectionLayers = { profile: 0, vector: 0, graph: 0 };
-  let selectedHits = [] as ReturnType<typeof fuseRoutes>;
   let graphTimedOut = false;
   let fallbackReason: string | undefined;
   let vectorHits = 0;
@@ -354,38 +247,12 @@ async function runRecall(
     });
     prependContext = injected.context;
     injectionLayers = injected.layerChars;
-    selectedHits = injected.selectedHits;
   };
 
   const emitTrace = (status: TraceRecord["status"]): void => {
+    if (!config.trace.enabled) return;
     const totalMs = Math.round(performance.now() - startedAt);
     const injected = prependContext ?? "";
-    try {
-      dependencies.onComplete?.({
-        schemaVersion: LOCAL_RETRIEVER_API_VERSION,
-        status,
-        decision: demand.decision,
-        reason: demand.reason,
-        depth,
-        routeDecision,
-        rankedHits: fused.map(asLocalEvidence),
-        selectedHits: selectedHits.map(asLocalEvidence),
-        ...(prependContext ? { context: prependContext } : {}),
-        diagnostics: {
-          totalMs,
-          ...metrics,
-          vectorHits,
-          graphHits,
-          profileHits,
-          deterministicQueries,
-          llmCalls,
-          ...(fallbackReason ? { fallbackReason } : {}),
-        },
-      });
-    } catch (error) {
-      api.logger?.warn?.(`active-recall adapter capture failed: ${String(error)}`);
-    }
-    if (!config.trace.enabled) return;
     queueTrace(api, {
       ts: new Date().toISOString(), session, profile: config.profile, status,
       elapsedMs: totalMs, totalMs,
@@ -635,69 +502,11 @@ async function runRecall(
   return prependContext ? { prependContext } : undefined;
 }
 
-export async function retrieveLocal(
-  api: PluginApi,
-  event: unknown,
-  ctx: RecallCtx,
-  config: RecallConfig,
-  dependencyOverrides: Partial<RecallDependencies> = {},
-): Promise<LocalRecallResult> {
-  let result: LocalRecallResult | undefined;
-  const callerCapture = dependencyOverrides.onComplete;
-  await runRecall(api, event, ctx, config, {
-    ...dependencyOverrides,
-    onComplete: (captured) => {
-      result = captured;
-      callerCapture?.(captured);
-    },
-  });
-  return result ?? emptyLocalResult("capture_missing", {
-    literalMs: 0,
-    gateMs: 0,
-    expansionMs: 0,
-    searchMs: 0,
-    fusionMs: 0,
-    vectorMs: 0,
-    graphMs: 0,
-    profileMs: 0,
-  });
-}
-
-function createLocalRetrieverProvider(api: PluginApi, config: RecallConfig): LocalRetrieverProvider {
-  return {
-    apiVersion: LOCAL_RETRIEVER_API_VERSION,
-    providerId: "active-recall",
-    plan: (request) => planLocalRecall({ prompt: request.prompt }, request.context, config),
-    retrieve: async (request) => {
-      const requestedBudget = typeof request.maxTotalMs === "number" && Number.isFinite(request.maxTotalMs)
-        ? Math.max(1, Math.round(request.maxTotalMs))
-        : config.maxTotalMs;
-      const boundedConfig = requestedBudget < config.maxTotalMs
-        ? { ...config, maxTotalMs: requestedBudget, searchTimeoutMs: Math.min(config.searchTimeoutMs, requestedBudget) }
-        : config;
-      return retrieveLocal(api, { prompt: request.prompt }, request.context, boundedConfig);
-    },
-  };
-}
-
 const plugin = {
   register(api: PluginApi): void {
     const config = readConfig(api.pluginConfig);
     if (!config.enabled) return;
-    if (config.retrievalMode === "standalone") {
-      api.on("before_prompt_build", (event, ctx) => runRecall(api, event, ctx as RecallCtx, config), { priority: 10 });
-    } else if (api.registerService) {
-      const provider = createLocalRetrieverProvider(api, config);
-      api.registerService({
-        id: "active-recall-local-retriever-v1",
-        start: () => {
-          if (!publishLocalRetriever(provider)) api.logger?.warn?.("active-recall adapter bridge already has a provider");
-        },
-        stop: () => { unpublishLocalRetriever(provider); },
-      });
-    } else {
-      api.logger?.warn?.("active-recall adapter mode requires OpenClaw registerService support");
-    }
+    api.on("before_prompt_build", (event, ctx) => runRecall(api, event, ctx as RecallCtx, config), { priority: 10 });
     if (effectiveWriterMode(config) !== "off") {
       api.on("agent_end", (event, ctx) => {
         enqueueMemoryWrite(api, event, ctx, config);

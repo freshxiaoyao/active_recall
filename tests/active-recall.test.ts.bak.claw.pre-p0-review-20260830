@@ -8,13 +8,8 @@ import { evaluateRecallDemand, routeRecallQuery } from "../demand.js";
 import { buildDeterministicSearchRoutes, hasTemporalCue, normalizeRecallQuery } from "../deterministic-expansion.js";
 import { buildExpansionSearchRoutes, expandQuery, parseExpansionContent } from "../expansion.js";
 import { canonicalPath, fuseRoutes, isStrongSignal, passesQualityGate, successfulRoutes } from "../fusion.js";
-import activeRecallPlugin, { injectContext, isInternalSession, planLocalRecall, resolveRecallRoute, retrieveLocal, runRecall } from "../index.js";
-import {
-  LOCAL_RETRIEVER_API_VERSION,
-  LOCAL_RETRIEVER_BRIDGE_KEY,
-  resolveLocalRetriever,
-  unpublishLocalRetriever,
-} from "../local-retriever.js";
+import activeRecallPlugin, { injectContext, isInternalSession, resolveRecallRoute, retrieveLocal, runRecall } from "../index.js";
+import { LOCAL_RETRIEVER_API_VERSION, resolveLocalRetriever } from "../local-retriever.js";
 import { evaluateSemanticRecall, parseSemanticGateContent } from "../semantic-gate.js";
 import type { SearchRoute } from "../fusion.js";
 
@@ -541,21 +536,6 @@ test("typed local retriever keeps internal session guards and zero search", asyn
   assert.deepEqual(result.selectedHits, []);
 });
 
-test("typed local planning reuses custom trigger, suppression, and explicit-mode semantics", () => {
-  const custom = readConfig({
-    trigger: {
-      mode: "explicit",
-      explicitPrefixes: ["!remember"],
-      suppressPrefixes: ["!forget"],
-      additionalKeywords: ["project atlas"],
-    },
-  });
-  assert.equal(planLocalRecall({ prompt: "!remember decision" }, recallCtx, custom).decision, "yes");
-  assert.equal(planLocalRecall({ prompt: "!forget 上次的决定" }, recallCtx, custom).reason, "suppressed");
-  assert.equal(planLocalRecall({ prompt: "project atlas status" }, recallCtx, custom).reason, "custom_keyword");
-  assert.equal(planLocalRecall({ prompt: "还记得我们上次的决定吗？" }, recallCtx, custom).decision, "no");
-});
-
 test("runRecall skips expansion for a strong literal hit", async () => {
   let searches = 0;
   let expansions = 0;
@@ -817,23 +797,13 @@ test("adapter mode omits the prompt hook, keeps writer independent, and owns a v
   const provider = resolveLocalRetriever();
   assert.equal(provider?.apiVersion, LOCAL_RETRIEVER_API_VERSION);
   assert.equal(provider?.providerId, "active-recall");
-  assert.equal(provider?.plan({
-    apiVersion: LOCAL_RETRIEVER_API_VERSION,
-    prompt: "什么是 RRF？",
-    context: { agentId: "main", sessionKey: "agent:main:user" },
-  }).decision, "no");
   const guarded = await provider?.retrieve({
     apiVersion: LOCAL_RETRIEVER_API_VERSION,
     prompt: "/recall must stay guarded",
     context: { agentId: "main", sessionKey: "agent:main:heartbeat" },
   });
   assert.equal(guarded?.status, "skipped_guard");
-  assert.ok(provider);
-  const replacement = { ...provider };
-  Reflect.set(globalThis, LOCAL_RETRIEVER_BRIDGE_KEY, replacement);
   await service?.stop?.();
-  assert.equal(resolveLocalRetriever(), replacement);
-  assert.equal(unpublishLocalRetriever(replacement), true);
   assert.equal(resolveLocalRetriever(), undefined);
 });
 

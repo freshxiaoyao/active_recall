@@ -7,7 +7,6 @@ import { normalizeEntityAlias } from "../entity-resolution.js";
 import { SqliteGraphProvider } from "../graph-provider.js";
 import {
   effectiveWriterMode,
-  extractSalientMemory,
   lastConversationTurn,
   resetWriterQueueForTests,
   runMemoryWrite,
@@ -142,35 +141,6 @@ test("writer guard skips failed and internal runs and extracts the last turn", (
   assert.deepEqual(lastConversationTurn(messages), { user: "new", assistant: "new answer" });
   assert.equal(shouldSkipMemoryWrite({ success: false, messages }, { agentId: "main", sessionKey: "agent:main:user" }, config), "run_failed");
   assert.equal(shouldSkipMemoryWrite({ success: true, messages }, { agentId: "main", sessionKey: "agent:main:graph-memory-writer:child" }, config), "internal_session");
-});
-
-test("writer json_object request explicitly asks DeepSeek for JSON", async () => {
-  const originalFetch = globalThis.fetch;
-  const apiKeyEnv = "ACTIVE_RECALL_WRITER_JSON_TEST_KEY";
-  const originalApiKey = process.env[apiKeyEnv];
-  let requestBody: Record<string, unknown> | undefined;
-  try {
-    process.env[apiKeyEnv] = "test-key";
-    globalThis.fetch = async (_input, init) => {
-      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      return new Response(JSON.stringify({
-        choices: [{ message: { content: '{"salient":false,"summary":"","entities":[],"relations":[],"profileFacts":[]}' } }],
-      }), { status: 200 });
-    };
-    const config = readConfig({
-      expansion: { apiKeyEnv, responseFormat: "json_object" },
-      graphMemory: { writer: { mode: "dry-run" } },
-    });
-    const extraction = await extractSalientMemory({ user: "hello", assistant: "hi" }, config);
-    assert.equal(extraction, null);
-    assert.equal((requestBody?.response_format as { type?: string })?.type, "json_object");
-    const messages = requestBody?.messages as Array<{ content?: unknown }> | undefined;
-    assert.ok(messages?.some(({ content }) => typeof content === "string" && /\bjson\b/i.test(content)));
-  } finally {
-    globalThis.fetch = originalFetch;
-    if (originalApiKey === undefined) delete process.env[apiKeyEnv];
-    else process.env[apiKeyEnv] = originalApiKey;
-  }
 });
 
 test("async writer is idempotent across graph, profile, and vector stores", async () => {

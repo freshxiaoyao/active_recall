@@ -10,12 +10,6 @@
     "additionalProperties": false,
     "properties": {
       "enabled": { "type": "boolean", "default": true },
-      "retrievalMode": {
-        "type": "string",
-        "enum": ["standalone", "adapter"],
-        "default": "standalone",
-        "description": "standalone keeps the existing prompt hook; adapter exposes one versioned in-process Local Retriever service for evidence-rag and omits that hook to prevent duplicate retrieval"
-      },
       "agents": { "type": "array", "items": { "type": "string" }, "default": ["main"] },
       "skipSystemEvents": { "type": "boolean", "default": true },
       "trigger": {

@@ -9,12 +9,7 @@ import { buildDeterministicSearchRoutes, hasTemporalCue, normalizeRecallQuery } 
 import { buildExpansionSearchRoutes, expandQuery, parseExpansionContent } from "../expansion.js";
 import { canonicalPath, fuseRoutes, isStrongSignal, passesQualityGate, successfulRoutes } from "../fusion.js";
 import activeRecallPlugin, { injectContext, isInternalSession, planLocalRecall, resolveRecallRoute, retrieveLocal, runRecall } from "../index.js";
-import {
-  LOCAL_RETRIEVER_API_VERSION,
-  LOCAL_RETRIEVER_BRIDGE_KEY,
-  resolveLocalRetriever,
-  unpublishLocalRetriever,
-} from "../local-retriever.js";
+import { LOCAL_RETRIEVER_API_VERSION, resolveLocalRetriever } from "../local-retriever.js";
 import { evaluateSemanticRecall, parseSemanticGateContent } from "../semantic-gate.js";
 import type { SearchRoute } from "../fusion.js";
 
@@ -828,12 +823,7 @@ test("adapter mode omits the prompt hook, keeps writer independent, and owns a v
     context: { agentId: "main", sessionKey: "agent:main:heartbeat" },
   });
   assert.equal(guarded?.status, "skipped_guard");
-  assert.ok(provider);
-  const replacement = { ...provider };
-  Reflect.set(globalThis, LOCAL_RETRIEVER_BRIDGE_KEY, replacement);
   await service?.stop?.();
-  assert.equal(resolveLocalRetriever(), replacement);
-  assert.equal(unpublishLocalRetriever(replacement), true);
   assert.equal(resolveLocalRetriever(), undefined);
 });
 

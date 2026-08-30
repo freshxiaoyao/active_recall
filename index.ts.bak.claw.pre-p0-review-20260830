@@ -20,7 +20,7 @@ import type { RecallTriggerReason } from "./demand.js";
 import type { ExpansionDiagnostics, ExpansionStatus } from "./expansion.js";
 import type { SearchRoute } from "./fusion.js";
 import type { RecallRoute } from "./graph-types.js";
-import type { LocalRecallEvidence, LocalRecallPlan, LocalRecallResult, LocalRetrieverProvider } from "./local-retriever.js";
+import type { LocalRecallEvidence, LocalRecallResult, LocalRetrieverProvider } from "./local-retriever.js";
 import type { SearchResult } from "./search.js";
 import type { TraceRecord } from "./trace.js";
 
@@ -229,68 +229,6 @@ export function resolveRecallRoute(route: RecallRoute, config: RecallConfig): Re
   return config.graphMemory.routeMode === "auto" ? route : config.graphMemory.routeMode;
 }
 
-interface LocalPlanState {
-  rawPrompt: string;
-  cleaned: string;
-  agent: string;
-  session: string;
-  guardReason?: string;
-  demand?: ReturnType<typeof evaluateRecallDemand>;
-  plan: LocalRecallPlan;
-}
-
-function resolveLocalPlanState(event: unknown, ctx: RecallCtx, config: RecallConfig): LocalPlanState {
-  const rawPrompt = promptText(event);
-  const cleaned = cleanPromptForSearch(rawPrompt);
-  const agent = agentId(ctx);
-  const session = sessionKey(ctx);
-  const guardReason = !cleaned
-    ? "empty_prompt"
-    : isInternalSession(session)
-      ? "internal_session"
-      : config.skipSystemEvents && isSystemEventPrompt(rawPrompt)
-        ? "system_event"
-        : !config.agents.includes(agent)
-          ? "agent_filtered"
-          : undefined;
-  if (guardReason) {
-    return {
-      rawPrompt,
-      cleaned,
-      agent,
-      session,
-      guardReason,
-      plan: {
-        schemaVersion: LOCAL_RETRIEVER_API_VERSION,
-        decision: "no",
-        reason: guardReason,
-        depth: "none",
-        routeDecision: "none",
-      },
-    };
-  }
-  const demand = evaluateRecallDemand(cleaned, config.trigger);
-  const noRecall = demand.decision === "no";
-  return {
-    rawPrompt,
-    cleaned,
-    agent,
-    session,
-    demand,
-    plan: {
-      schemaVersion: LOCAL_RETRIEVER_API_VERSION,
-      decision: demand.decision,
-      reason: demand.reason,
-      depth: noRecall ? "none" : demand.depth ?? depthForProfile(config.profile),
-      routeDecision: noRecall ? "none" : resolveRecallRoute(demand.route, config),
-    },
-  };
-}
-
-export function planLocalRecall(event: unknown, ctx: RecallCtx, config: RecallConfig): LocalRecallPlan {
-  return resolveLocalPlanState(event, ctx, config).plan;
-}
-
 async function runRecall(
   api: PluginApi,
   event: unknown,
@@ -307,20 +245,31 @@ async function runRecall(
   };
   const startedAt = performance.now();
   const metrics: PhaseMetrics = { literalMs: 0, gateMs: 0, expansionMs: 0, searchMs: 0, fusionMs: 0, vectorMs: 0, graphMs: 0, profileMs: 0 };
-  const localPlan = resolveLocalPlanState(event, ctx, config);
-  const { rawPrompt, cleaned, agent, session } = localPlan;
-  if (localPlan.guardReason) {
+  const rawPrompt = promptText(event);
+  const cleaned = cleanPromptForSearch(rawPrompt);
+  const agent = agentId(ctx);
+  const session = sessionKey(ctx);
+  const guardReason = !cleaned
+    ? "empty_prompt"
+    : isInternalSession(session)
+      ? "internal_session"
+      : config.skipSystemEvents && isSystemEventPrompt(rawPrompt)
+        ? "system_event"
+        : !config.agents.includes(agent)
+          ? "agent_filtered"
+          : undefined;
+  if (guardReason) {
     try {
-      dependencies.onComplete?.(emptyLocalResult(localPlan.guardReason, metrics, Math.round(performance.now() - startedAt)));
+      dependencies.onComplete?.(emptyLocalResult(guardReason, metrics, Math.round(performance.now() - startedAt)));
     } catch (error) {
       api.logger?.warn?.(`active-recall adapter capture failed: ${String(error)}`);
     }
     return undefined;
   }
 
-  const demand = localPlan.demand as ReturnType<typeof evaluateRecallDemand>;
-  let routeDecision = localPlan.plan.routeDecision;
-  let depth: RecallDepth = localPlan.plan.depth;
+  const demand = evaluateRecallDemand(cleaned, config.trigger);
+  let routeDecision = resolveRecallRoute(demand.route, config);
+  let depth: RecallDepth = demand.depth ?? depthForProfile(config.profile);
   let gateStatus: NonNullable<TraceRecord["gateStatus"]> = "not_run";
   let gateReason = demand.reason;
   let gateFinishReason: string | undefined;
@@ -667,16 +616,7 @@ function createLocalRetrieverProvider(api: PluginApi, config: RecallConfig): Loc
   return {
     apiVersion: LOCAL_RETRIEVER_API_VERSION,
     providerId: "active-recall",
-    plan: (request) => planLocalRecall({ prompt: request.prompt }, request.context, config),
-    retrieve: async (request) => {
-      const requestedBudget = typeof request.maxTotalMs === "number" && Number.isFinite(request.maxTotalMs)
-        ? Math.max(1, Math.round(request.maxTotalMs))
-        : config.maxTotalMs;
-      const boundedConfig = requestedBudget < config.maxTotalMs
-        ? { ...config, maxTotalMs: requestedBudget, searchTimeoutMs: Math.min(config.searchTimeoutMs, requestedBudget) }
-        : config;
-      return retrieveLocal(api, { prompt: request.prompt }, request.context, boundedConfig);
-    },
+    retrieve: async (request) => retrieveLocal(api, { prompt: request.prompt }, request.context, config),
   };
 }
 

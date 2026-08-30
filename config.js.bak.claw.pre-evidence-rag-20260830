@@ -106,8 +106,6 @@
 
 
 
-
-
 const profileBudgets                                = {
   speed: 400,
   balanced: 800,
@@ -162,10 +160,6 @@ function graphWriterModeValue(value         , fallback                 )        
     : fallback;
 }
 
-function retrievalModeValue(value         )                {
-  return value === "adapter" ? "adapter" : "standalone";
-}
-
 function stringArray(value         , fallback          )           {
   if (!Array.isArray(value)) return [...fallback];
   const output = value
@@ -209,7 +203,6 @@ export function readConfig(pluginConfig         )               {
 
   return {
     enabled: booleanValue(raw.enabled, true),
-    retrievalMode: retrievalModeValue(raw.retrievalMode),
     agents: Array.isArray(raw.agents) && raw.agents.every((item) => typeof item === "string")
       ? raw.agents
       : ["main"],
