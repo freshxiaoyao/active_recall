@@ -38,6 +38,7 @@ export function messageTextContent(content: unknown): MessageTextContent {
 export function thinkingRequestField(endpoint: string, mode: ThinkingMode): Record<string, unknown> {
   if (mode === "omit") return {};
   if (mode === "enabled" || mode === "disabled") return { thinking: { type: mode } };
+  if (mode === "low" || mode === "high" || mode === "max") return { reasoning_effort: mode };
   try {
     const hostname = new URL(endpoint).hostname.toLocaleLowerCase();
     return hostname === "api.deepseek.com" || hostname.endsWith(".api.deepseek.com")

@@ -44,7 +44,7 @@
           "minRemainingBudgetMs": { "type": "number", "minimum": 2500, "maximum": 60000, "default": 2750, "description": "Do not start LLM rescue unless at least this much total budget remains" },
           "maxOutputTokens": { "type": "number", "minimum": 50, "maximum": 4000, "default": 800 },
           "responseFormat": { "type": "string", "enum": ["json_object", "json_schema"], "default": "json_object" },
-          "thinkingMode": { "type": "string", "enum": ["auto", "enabled", "disabled", "omit", "low", "high", "max"], "default": "auto", "description": "auto disables thinking for the official DeepSeek endpoint and omits the field elsewhere" },
+          "thinkingMode": { "type": "string", "enum": ["auto", "enabled", "disabled", "omit"], "default": "auto", "description": "auto disables thinking for the official DeepSeek endpoint and omits the field elsewhere" },
           "associations": {
             "type": "object",
             "additionalProperties": false,
@@ -63,19 +63,6 @@
           "model": { "type": "string", "description": "Defaults to expansion.model" },
           "timeoutMs": { "type": "number", "minimum": 200, "maximum": 5000, "default": 1800 },
           "maxOutputTokens": { "type": "number", "minimum": 50, "maximum": 500, "default": 160 }
-        }
-      },
-      "projectScope": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "enabled": { "type": "boolean", "default": true, "description": "Resolve the current Git project and apply Active Recall-side namespace filtering without changing memory-core" },
-          "sameProjectBoost": { "type": "number", "minimum": 1, "maximum": 5, "default": 1.5 },
-          "includeGlobal": { "type": "boolean", "default": true },
-          "otherProjectPolicy": { "type": "string", "enum": ["exclude", "low-weight"], "default": "exclude" },
-          "otherProjectWeight": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.25 },
-          "candidateMultiplier": { "type": "number", "minimum": 1, "maximum": 5, "default": 3, "description": "Bounded over-fetch within each existing search so post-filtering cannot easily starve same-project candidates" },
-          "gitTimeoutMs": { "type": "integer", "minimum": 25, "maximum": 2000, "default": 250 }
         }
       },
       "strongSignal": {

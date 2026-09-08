@@ -36,9 +36,6 @@ export interface SearchHit {
   textScore?: number;
   snippet: string;
   source: string;
-  /** Active Recall ranking metadata; memory-core remains unaware of project scope. */
-  projectScope?: "same-project" | "global" | "other-project";
-  projectWeight?: number;
 }
 
 export interface SearchTiming {

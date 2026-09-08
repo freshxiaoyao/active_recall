@@ -16,7 +16,6 @@ import {
   writerCircuitStateForTests,
 } from "../memory-writer.js";
 import type { GraphEpisodeInput } from "../graph-types.js";
-import { projectNamespace } from "../project-scope.js";
 
 const episode = (input: Partial<GraphEpisodeInput> & Pick<GraphEpisodeInput, "id" | "entities" | "relations">): GraphEpisodeInput => ({
   sessionKey: "agent:main:user-test",
@@ -205,69 +204,6 @@ test("async writer is idempotent across graph, profile, and vector stores", asyn
     assert.deepEqual({ status: second.status, graphWrite: second.graphWrite, vectorWrite: second.vectorWrite }, { status: "ok", graphWrite: false, vectorWrite: false });
     const profile = JSON.parse(await readFile(join(temp, "profile.json"), "utf8")) as { facts: unknown[] };
     assert.equal(profile.facts.length, 1);
-  } finally {
-    await rm(temp, { recursive: true, force: true });
-  }
-});
-
-test("writer separates project and global episodes without changing the graph schema", async () => {
-  const temp = await mkdtemp(join(process.cwd(), ".graph-memory-project-scope-"));
-  const config = readConfig({
-    projectScope: { enabled: true },
-    graphMemory: {
-      enabled: true,
-      file: join(temp, "graph.sqlite"),
-      profileFile: join(temp, "profile.json"),
-      vectorDir: join(temp, "episodes"),
-      writer: { traceFile: join(temp, "write-traces.jsonl") },
-    },
-    trace: { enabled: false },
-  });
-  const identity = {
-    scope: "project" as const,
-    projectId: "github.com/acme/repo-a",
-    projectRoot: "C:\\src\\repo-a",
-    repoRemote: "github.com/acme/repo-a",
-    namespace: projectNamespace("github.com/acme/repo-a"),
-    identitySource: "remote" as const,
-  };
-  const ctx = { agentId: "main", sessionKey: "agent:main:user-test", workspaceDir: temp };
-  const baseEvent = {
-    success: true,
-    messages: [{ role: "user", content: "remember the probe" }, { role: "assistant", content: "stored" }],
-  };
-  try {
-    const projectResult = await runMemoryWrite({}, { ...baseEvent, runId: "project-probe-run" }, ctx, config, {
-      resolveProject: async () => identity,
-      extract: async () => ({
-        memoryScope: "project",
-        summary: "repo-a-only-probe",
-        entities: [{ name: "repo-a-only-probe", type: "Project" as const }],
-        relations: [],
-        profileFacts: [],
-      }),
-      sync: async () => true,
-    });
-    const globalResult = await runMemoryWrite({}, { ...baseEvent, runId: "global-probe-run" }, ctx, config, {
-      resolveProject: async () => identity,
-      extract: async () => ({
-        memoryScope: "global",
-        summary: "global-probe",
-        entities: [{ name: "global-probe", type: "Project" as const }],
-        relations: [],
-        profileFacts: [],
-      }),
-      sync: async () => true,
-    });
-    assert.equal(projectResult.memoryScope, "project");
-    assert.equal(globalResult.memoryScope, "global");
-    const projectFile = join(temp, "episodes", "projects", identity.namespace, `${projectResult.episodeId}.md`);
-    const globalFile = join(temp, "episodes", "global", `${globalResult.episodeId}.md`);
-    const projectMarkdown = await readFile(projectFile, "utf8");
-    assert.match(projectMarkdown, /Memory-Scope: project/);
-    assert.match(projectMarkdown, /Project-ID: github\.com\/acme\/repo-a/);
-    assert.match(projectMarkdown, /Repo-Remote: github\.com\/acme\/repo-a/);
-    assert.match(await readFile(globalFile, "utf8"), /Memory-Scope: global/);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

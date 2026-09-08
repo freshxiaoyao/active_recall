@@ -16,12 +16,6 @@ import {
   unpublishLocalRetriever,
 } from "../local-retriever.js";
 import { evaluateSemanticRecall, parseSemanticGateContent } from "../semantic-gate.js";
-import {
-  applyProjectScope,
-  normalizeRepoRemote,
-  projectNamespace,
-  resolveProjectIdentity,
-} from "../project-scope.js";
 import type { SearchRoute } from "../fusion.js";
 
 const route = (name: string, hits: Array<{ path: string; score: number; source?: string; snippet?: string; line?: number }>, weight = 1): SearchRoute => ({
@@ -225,97 +219,6 @@ test("raw-score blend prefers stronger evidence at equal RRF rank", () => {
     route("high", [{ path: "z-high", score: 0.9 }]),
   ], { k: 20, preferSources: { memory: 1 }, snippetChars: 100, topK: 5, rawScoreBlend: 0.5 });
   assert.deepEqual(fused.map((hit) => hit.path), ["z-high", "a-low"]);
-});
-
-test("HTTPS, SSH, and scp-like remotes share one canonical project identity", () => {
-  const expected = "github.com/foo/bar";
-  for (const remote of [
-    "git@github.com:foo/bar.git",
-    "ssh://git@github.com/foo/bar.git",
-    "https://github.com/foo/bar.git",
-    "https://secret-token@github.com/foo/bar.git",
-    "HTTPS://GITHUB.COM/FOO/BAR/",
-  ]) assert.equal(normalizeRepoRemote(remote), expected, remote);
-  assert.equal(normalizeRepoRemote("file:///C:/repo/foo"), undefined);
-  assert.equal(projectNamespace(expected), projectNamespace(normalizeRepoRemote("git@github.com:foo/bar.git")!));
-});
-
-test("project identity prefers remote, handles nested/worktree roots, and fails global outside Git", async () => {
-  const calls: string[][] = [];
-  const remoteIdentity = await resolveProjectIdentity("C:\\worktrees\\feature\\nested", 250, async (_cwd, args) => {
-    calls.push(args);
-    if (args[0] === "rev-parse" && args[1] === "--show-toplevel") return "C:\\worktrees\\feature";
-    if (args[0] === "config") return "git@github.com:foo/bar.git";
-    throw new Error("unexpected git call");
-  });
-  assert.equal(remoteIdentity.projectId, "github.com/foo/bar");
-  assert.equal(remoteIdentity.identitySource, "remote");
-  assert.equal(calls.some((args) => args.includes("--git-common-dir")), false);
-
-  const noRemoteWorktree = await resolveProjectIdentity("C:\\repo-worktree\\nested", 250, async (_cwd, args) => {
-    if (args[1] === "--show-toplevel") return "C:\\repo-worktree";
-    if (args[0] === "config") throw new Error("no remote");
-    if (args[1] === "--git-common-dir") return "C:\\repo\\.git";
-    throw new Error("unexpected git call");
-  });
-  assert.equal(noRemoteWorktree.identitySource, "root");
-  assert.equal(noRemoteWorktree.projectId, process.platform === "win32" ? "c:/repo" : "C:/repo");
-
-  const global = await resolveProjectIdentity("C:\\not-a-repo", 250, async () => { throw new Error("not git"); });
-  assert.deepEqual(global, { scope: "global", reason: "not_git_repository" });
-});
-
-test("project candidate policy keeps same-project and global, excludes other projects, and preserves legacy memory", () => {
-  const config = readConfig({ projectScope: { enabled: true } });
-  const repoA = { scope: "project" as const, projectId: "github.com/acme/a", namespace: projectNamespace("github.com/acme/a") };
-  const repoB = { scope: "project" as const, projectId: "github.com/acme/b", namespace: projectNamespace("github.com/acme/b") };
-  const all = searchResult([
-    { path: `memory/graph-memory/episodes/projects/${repoA.namespace}/repo-a-probe.md`, score: 0.8 },
-    { path: `memory/graph-memory/episodes/projects/${repoB.namespace}/repo-b-probe.md`, score: 0.8 },
-    { path: "memory/graph-memory/episodes/global/global-probe.md", score: 0.8 },
-    { path: "memory/graph-memory/episodes/historical-flat.md", score: 0.8 },
-  ]);
-  const forA = applyProjectScope(all, repoA, config.projectScope, config.graphMemory.vectorDir);
-  const forB = applyProjectScope(all, repoB, config.projectScope, config.graphMemory.vectorDir);
-  assert.deepEqual(forA.hits.map((hit) => hit.path), [
-    `memory/graph-memory/episodes/projects/${repoA.namespace}/repo-a-probe.md`,
-    "memory/graph-memory/episodes/global/global-probe.md",
-    "memory/graph-memory/episodes/historical-flat.md",
-  ]);
-  assert.deepEqual(forB.hits.map((hit) => hit.path), [
-    `memory/graph-memory/episodes/projects/${repoB.namespace}/repo-b-probe.md`,
-    "memory/graph-memory/episodes/global/global-probe.md",
-    "memory/graph-memory/episodes/historical-flat.md",
-  ]);
-  assert.equal(forA.hits[0].projectWeight, 1.5);
-  assert.equal(forA.hits[1].projectScope, "global");
-
-  const outsideGit = applyProjectScope(all, { scope: "global" }, config.projectScope, config.graphMemory.vectorDir);
-  assert.deepEqual(outsideGit.hits.map((hit) => hit.path), [
-    "memory/graph-memory/episodes/global/global-probe.md",
-    "memory/graph-memory/episodes/historical-flat.md",
-  ]);
-  const lowWeightConfig = readConfig({ projectScope: { otherProjectPolicy: "low-weight", otherProjectWeight: 0.2 } });
-  const crossProject = applyProjectScope(all, repoA, lowWeightConfig.projectScope, lowWeightConfig.graphMemory.vectorDir);
-  assert.equal(crossProject.hits.find((hit) => hit.path.includes(repoB.namespace!))?.projectWeight, 0.2);
-});
-
-test("project boost changes only final ranking while raw quality remains semantic", () => {
-  const config = readConfig({ projectScope: { sameProjectBoost: 1.5 } });
-  const identity = { scope: "project" as const, projectId: "github.com/acme/a", namespace: projectNamespace("github.com/acme/a") };
-  const scoped = applyProjectScope(searchResult([
-    { path: "memory/graph-memory/episodes/global/global.md", score: 0.9 },
-    { path: `memory/graph-memory/episodes/projects/${identity.namespace}/same.md`, score: 0.8 },
-  ]), identity, config.projectScope, config.graphMemory.vectorDir);
-  const fused = fuseRoutes([{ route: "literal", weight: 1, result: scoped }], {
-    k: 20, preferSources: { memory: 1 }, snippetChars: 100, topK: 5, rawScoreBlend: 0,
-  });
-  assert.deepEqual(fused.map((hit) => hit.path), [
-    `memory/graph-memory/episodes/projects/${identity.namespace}/same.md`,
-    "memory/graph-memory/episodes/global/global.md",
-  ]);
-  assert.equal(fused[0].bestRawScore, 0.8);
-  assert.equal(fused[0].projectWeight, 1.5);
 });
 
 test("expanded routes exclude literal-equivalent and duplicate generated queries", () => {
@@ -624,31 +527,6 @@ test("typed local retriever preserves the standalone context and budget-selected
   assert.match(typed.context ?? "", /memory\/project\.md#L42/);
 });
 
-test("typed local retrieval isolates repo A and repo B while both retain global evidence", async () => {
-  const config = readConfig({ trace: { enabled: false }, projectScope: { enabled: true } });
-  const repoA = { scope: "project" as const, projectId: "github.com/acme/a", namespace: projectNamespace("github.com/acme/a"), identitySource: "remote" as const };
-  const repoB = { scope: "project" as const, projectId: "github.com/acme/b", namespace: projectNamespace("github.com/acme/b"), identitySource: "remote" as const };
-  const search = async () => searchResult([
-    { path: `memory/graph-memory/episodes/projects/${repoA.namespace}/repo-a-unique-probe.md`, score: 0.9 },
-    { path: `memory/graph-memory/episodes/projects/${repoB.namespace}/repo-b-unique-probe.md`, score: 0.9 },
-    { path: "memory/graph-memory/episodes/global/global-probe.md", score: 0.9 },
-  ]);
-  const forA = await retrieveLocal(pluginApi, { prompt: "/recall unique probe" }, recallCtx, config, {
-    search,
-    resolveProject: async () => repoA,
-  });
-  const forB = await retrieveLocal(pluginApi, { prompt: "/recall unique probe" }, recallCtx, config, {
-    search,
-    resolveProject: async () => repoB,
-  });
-  assert.match(forA.context ?? "", /repo-a-unique-probe/);
-  assert.doesNotMatch(forA.context ?? "", /repo-b-unique-probe/);
-  assert.match(forA.context ?? "", /global-probe/);
-  assert.match(forB.context ?? "", /repo-b-unique-probe/);
-  assert.doesNotMatch(forB.context ?? "", /repo-a-unique-probe/);
-  assert.match(forB.context ?? "", /global-probe/);
-});
-
 test("typed local retriever keeps internal session guards and zero search", async () => {
   let searches = 0;
   const result = await retrieveLocal(pluginApi, { prompt: "/recall private memory" }, {
@@ -691,14 +569,14 @@ test("runRecall skips expansion for a strong literal hit", async () => {
   assert.equal(expansions, 0);
 });
 
-test("uncertain demand uses one scored BGE probe with bounded project over-fetch, not an LLM", async () => {
+test("uncertain demand uses a scored BGE topK=1 probe, not presence-only or an LLM", async () => {
   let searches = 0;
   let expansions = 0;
   const config = readConfig({ trace: { enabled: false } });
   const rejected = await runRecall(pluginApi, { prompt: "Tune this current implementation" }, recallCtx, config, {
     search: async (_query, options) => {
       searches += 1;
-      assert.equal(options.maxResults, 3);
+      assert.equal(options.maxResults, 1);
       return searchResult([{ path: "memory/plugin.md", score: 0.6 }]);
     },
     expand: async () => { expansions += 1; throw new Error("must not expand"); },
@@ -896,15 +774,6 @@ test("quality-tuned defaults stay aligned", () => {
   assert.equal(config.expansion.thinkingMode, "auto");
   assert.equal(config.semanticGate.timeoutMs, 1800);
   assert.equal(config.semanticGate.enabled, false);
-  assert.deepEqual(config.projectScope, {
-    enabled: true,
-    sameProjectBoost: 1.5,
-    includeGlobal: true,
-    otherProjectPolicy: "exclude",
-    otherProjectWeight: 0.25,
-    candidateMultiplier: 3,
-    gitTimeoutMs: 250,
-  });
   assert.equal(config.strongSignal.sources.sessions.minScore, 0.92);
   assert.equal(config.strongSignal.sources.sessions.gap, 0.2);
   assert.equal(config.rrf.k, 20);

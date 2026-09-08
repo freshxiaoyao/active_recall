@@ -1,46 +1,44 @@
+import type { SearchHit, SearchResult } from "./search.js";
 
+export interface SearchRoute {
+  route: string;
+  weight: number;
+  result: SearchResult;
+}
 
+export interface FusedHit {
+  path: string;
+  line?: number;
+  bestRawScore: number;
+  rrfScore: number;
+  routeHits: number;
+  sourceWeight: number;
+  finalRankScore: number;
+  /** Compatibility alias for existing trace consumers. */
+  finalScore: number;
+  snippet: string;
+  source: string;
+  routes: string[];
+  occurrences: number;
+}
 
+export interface FusionSettings {
+  k: number;
+  preferSources: Record<string, number>;
+  snippetChars: number;
+  topK: number;
+  minRawScore?: number;
+  rawScoreBlend?: number;
+  qualityGate?: { highRawScore: number; mediumRawScore: number; minRouteHits: number };
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-export function canonicalPath(path        )         {
+export function canonicalPath(path: string): string {
   const normalized = path.trim().replace(/\\/g, "/").replace(/\/{2,}/g, "/");
   return process.platform === "win32" ? normalized.toLocaleLowerCase() : normalized;
 }
 
-function distinctPathHits(hits             , minRawScore        )                                                 {
-  const byPath = new Map                                                                    ();
+function distinctPathHits(hits: SearchHit[], minRawScore: number): Array<{ hit: SearchHit; occurrences: number }> {
+  const byPath = new Map<string, { hit: SearchHit; occurrences: number; firstRank: number }>();
   hits.forEach((hit, index) => {
     if (hit.score < minRawScore) return;
     const key = canonicalPath(hit.path);
@@ -57,7 +55,7 @@ function distinctPathHits(hits             , minRawScore        )               
     .map(({ hit, occurrences }) => ({ hit, occurrences }));
 }
 
-function strongCalibrationKey(hit           )         {
+function strongCalibrationKey(hit: SearchHit): string {
   if (hit.source !== "memory") return hit.source;
   const normalizedPath = hit.path.trim().replace(/\\/g, "/").replace(/^\.\//, "").toLocaleLowerCase();
   const isCuratedMemory = normalizedPath === "memory.md"
@@ -68,14 +66,14 @@ function strongCalibrationKey(hit           )         {
 }
 
 export function isStrongSignal(
-  hits             ,
-  settings
-
-
-
-
-   ,
-)          {
+  hits: SearchHit[],
+  settings: {
+    enabled: boolean;
+    minScore: number;
+    gap: number;
+    sources?: Record<string, { minScore: number; gap: number }>;
+  },
+): boolean {
   if (!settings.enabled || hits.length === 0) return false;
   const unique = distinctPathHits(hits, Number.NEGATIVE_INFINITY)
     .map(({ hit }) => hit)
@@ -89,19 +87,19 @@ export function isStrongSignal(
 }
 
 export function passesQualityGate(
-  hit                                              ,
-  gate                                                                        ,
-)          {
+  hit: Pick<FusedHit, "bestRawScore" | "routeHits">,
+  gate: { highRawScore: number; mediumRawScore: number; minRouteHits: number },
+): boolean {
   return hit.bestRawScore >= gate.highRawScore
     || (hit.bestRawScore >= gate.mediumRawScore && hit.routeHits >= gate.minRouteHits);
 }
 
-export function successfulRoutes(settled                                     )                {
+export function successfulRoutes(settled: PromiseSettledResult<SearchRoute>[]): SearchRoute[] {
   return settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
 }
 
-export function fuseRoutes(routes               , settings                )             {
-  const byPath = new Map                  ();
+export function fuseRoutes(routes: SearchRoute[], settings: FusionSettings): FusedHit[] {
+  const byPath = new Map<string, FusedHit>();
   for (const route of routes) {
     distinctPathHits(route.result.hits, settings.minRawScore ?? Number.NEGATIVE_INFINITY)
       .forEach(({ hit, occurrences }, index) => {
@@ -123,8 +121,6 @@ export function fuseRoutes(routes               , settings                )     
             current.line = hit.line;
             current.source = hit.source;
             current.sourceWeight = settings.preferSources[hit.source] ?? 1;
-            current.projectScope = hit.projectScope;
-            current.projectWeight = hit.projectWeight ?? 1;
             current.path = hit.path;
           }
           return;
@@ -135,8 +131,6 @@ export function fuseRoutes(routes               , settings                )     
           rrfScore: baseContribution,
           routeHits: 1,
           sourceWeight: settings.preferSources[hit.source] ?? 1,
-          projectScope: hit.projectScope,
-          projectWeight: hit.projectWeight ?? 1,
           finalRankScore: contribution,
           finalScore: contribution,
           snippet: hit.snippet,
@@ -151,13 +145,10 @@ export function fuseRoutes(routes               , settings                )     
     .map((hit) => ({
       ...hit,
       snippet: hit.snippet.slice(0, settings.snippetChars),
-      finalRankScore: hit.finalScore * hit.sourceWeight * hit.projectWeight,
-      finalScore: hit.finalScore * hit.sourceWeight * hit.projectWeight,
+      finalRankScore: hit.finalScore * hit.sourceWeight,
+      finalScore: hit.finalScore * hit.sourceWeight,
     }))
     .filter((hit) => !settings.qualityGate || passesQualityGate(hit, settings.qualityGate))
     .sort((a, b) => b.finalRankScore - a.finalRankScore || b.bestRawScore - a.bestRawScore || a.path.localeCompare(b.path))
     .slice(0, settings.topK);
 }
-
-
-//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active_recall\fusion.ts

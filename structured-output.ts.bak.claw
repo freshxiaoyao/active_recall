@@ -1,10 +1,51 @@
-import type { StructuredOutputMode } from "./config.js";
+import type { StructuredOutputMode, ThinkingMode } from "./config.js";
 
 export type JsonParseMode = "strict" | "fence" | "balanced" | "repair";
 
 export interface JsonCandidate {
   value: unknown;
   mode: JsonParseMode;
+}
+
+export interface MessageTextContent {
+  text: string | null;
+  contentType: "string" | "array" | "null" | "undefined" | "object" | "other";
+}
+
+/** Accept OpenAI-compatible string content plus the common array-of-text-parts variant. */
+export function messageTextContent(content: unknown): MessageTextContent {
+  if (typeof content === "string") return { text: content, contentType: "string" };
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const part of content) {
+      if (typeof part === "string") {
+        parts.push(part);
+        continue;
+      }
+      if (part === null || typeof part !== "object" || Array.isArray(part)) continue;
+      const item = part as { text?: unknown; content?: unknown };
+      if (typeof item.text === "string") parts.push(item.text);
+      else if (typeof item.content === "string") parts.push(item.content);
+    }
+    return { text: parts.length > 0 ? parts.join("") : null, contentType: "array" };
+  }
+  if (content === null) return { text: null, contentType: "null" };
+  if (content === undefined) return { text: null, contentType: "undefined" };
+  return { text: null, contentType: typeof content === "object" ? "object" : "other" };
+}
+
+/** DeepSeek defaults to thinking; these tiny structured tasks are faster and more reliable without it. */
+export function thinkingRequestField(endpoint: string, mode: ThinkingMode): Record<string, unknown> {
+  if (mode === "omit") return {};
+  if (mode === "enabled" || mode === "disabled") return { thinking: { type: mode } };
+  try {
+    const hostname = new URL(endpoint).hostname.toLocaleLowerCase();
+    return hostname === "api.deepseek.com" || hostname.endsWith(".api.deepseek.com")
+      ? { thinking: { type: "disabled" } }
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 function stripCodeFence(content: string): string | null {

@@ -9,8 +9,6 @@ export interface LocalRetrieverContext {
   agentId?: string;
   sessionKey?: string;
   workspaceDir?: string;
-  /** Optional foreground/project cwd supplied by adapters; OpenClaw hooks currently expose workspaceDir only. */
-  cwd?: string;
 }
 
 export interface LocalRetrieverRequest {
@@ -38,8 +36,6 @@ export interface LocalRecallEvidence {
   rrfScore: number;
   routeHits: number;
   sourceWeight: number;
-  projectScope?: "same-project" | "global" | "other-project";
-  projectWeight: number;
   finalRankScore: number;
   /** Compatibility alias retained by active-recall's current fusion contract. */
   finalScore: number;

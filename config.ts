@@ -7,6 +7,17 @@ export type GraphMemoryProvider = "local-sqlite" | "graphiti" | "falkordb" | "ne
 export type GraphRouteMode = "auto" | "vector" | "graph" | "hybrid";
 export type GraphWriterMode = "off" | "dry-run" | "shadow" | "write";
 export type RetrievalMode = "standalone" | "adapter";
+export type OtherProjectPolicy = "exclude" | "low-weight";
+
+export interface ProjectScopeConfig {
+  enabled: boolean;
+  sameProjectBoost: number;
+  includeGlobal: boolean;
+  otherProjectPolicy: OtherProjectPolicy;
+  otherProjectWeight: number;
+  candidateMultiplier: number;
+  gitTimeoutMs: number;
+}
 
 export interface RecallTriggerConfig {
   mode: RecallTriggerMode;
@@ -85,6 +96,7 @@ export interface RecallConfig {
   searchTimeoutMs: number;
   expansion: ExpansionConfig;
   semanticGate: SemanticGateConfig;
+  projectScope: ProjectScopeConfig;
   graphMemory: GraphMemoryConfig;
   strongSignal: StrongSignalCalibration & {
     enabled: boolean;
@@ -166,6 +178,10 @@ function retrievalModeValue(value: unknown): RetrievalMode {
   return value === "adapter" ? "adapter" : "standalone";
 }
 
+function otherProjectPolicyValue(value: unknown): OtherProjectPolicy {
+  return value === "low-weight" ? "low-weight" : "exclude";
+}
+
 function stringArray(value: unknown, fallback: string[]): string[] {
   if (!Array.isArray(value)) return [...fallback];
   const output = value
@@ -201,6 +217,7 @@ export function readConfig(pluginConfig: unknown): RecallConfig {
   const strongSources = record(strongSignal.sources);
   const qualityGate = record(raw.qualityGate);
   const semanticGate = record(raw.semanticGate);
+  const projectScope = record(raw.projectScope);
   const graphMemory = record(raw.graphMemory);
   const graphWriter = record(graphMemory.writer);
   const graphWriterCircuitBreaker = record(graphWriter.circuitBreaker);
@@ -244,6 +261,15 @@ export function readConfig(pluginConfig: unknown): RecallConfig {
       model: stringValue(semanticGate.model, stringValue(expansion.model, "deepseek-v4-flash")),
       timeoutMs: numberValue(semanticGate.timeoutMs, 1800),
       maxOutputTokens: numberValue(semanticGate.maxOutputTokens, 160),
+    },
+    projectScope: {
+      enabled: booleanValue(projectScope.enabled, true),
+      sameProjectBoost: numberValue(projectScope.sameProjectBoost, 1.5),
+      includeGlobal: booleanValue(projectScope.includeGlobal, true),
+      otherProjectPolicy: otherProjectPolicyValue(projectScope.otherProjectPolicy),
+      otherProjectWeight: numberValue(projectScope.otherProjectWeight, 0.25),
+      candidateMultiplier: Math.max(1, Math.min(5, numberValue(projectScope.candidateMultiplier, 3))),
+      gitTimeoutMs: Math.max(25, Math.min(2000, Math.round(numberValue(projectScope.gitTimeoutMs, 250)))),
     },
     graphMemory: {
       enabled: booleanValue(graphMemory.enabled, false),

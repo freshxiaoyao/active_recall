@@ -36,11 +36,6 @@ export interface GraphEpisodeInput {
   occurredAt: string;
   source: string;
   sourcePath?: string;
-  memoryScope?: "global" | "project";
-  projectId?: string;
-  projectRoot?: string;
-  repoRemote?: string;
-  projectNamespace?: string;
   summary: string;
   entities: GraphEntityInput[];
   relations: GraphRelationInput[];

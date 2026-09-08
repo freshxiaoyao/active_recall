@@ -7,6 +7,7 @@ import { fuseRoutes, isStrongSignal, successfulRoutes } from "./fusion.js";
 import { createGraphProvider } from "./graph-provider.js";
 import { effectiveWriterMode, enqueueMemoryWrite } from "./memory-writer.js";
 import { ProfileMemoryStore } from "./profile-memory.js";
+import { applyProjectScope, resolveProjectIdentity } from "./project-scope.js";
 import {
   LOCAL_RETRIEVER_API_VERSION,
   publishLocalRetriever,
@@ -22,6 +23,7 @@ import type { SearchRoute } from "./fusion.js";
 import type { RecallRoute } from "./graph-types.js";
 import type { LocalRecallEvidence, LocalRecallPlan, LocalRecallResult, LocalRetrieverProvider } from "./local-retriever.js";
 import type { SearchResult } from "./search.js";
+import type { ProjectIdentity } from "./project-scope.js";
 import type { TraceRecord } from "./trace.js";
 
 interface PluginApi {
@@ -62,6 +64,7 @@ interface RecallCtx {
   agentId?: string;
   sessionKey?: string;
   workspaceDir?: string;
+  cwd?: string;
 }
 
 function agentId(ctx: RecallCtx): string {
@@ -123,6 +126,12 @@ function boundedTimeout(configuredMs: number, remaining: number): number {
   return Math.max(1, Math.min(configuredMs, Math.max(0, remaining)));
 }
 
+function scopedMaxResults(base: number, config: RecallConfig): number {
+  return config.projectScope.enabled
+    ? Math.min(20, Math.max(base, Math.ceil(base * config.projectScope.candidateMultiplier)))
+    : base;
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), Math.max(1, timeoutMs));
@@ -179,12 +188,13 @@ export interface RecallDependencies {
   expand: typeof expandQuery;
   graphSearch: (query: string, config: RecallConfig, ctx: RecallCtx) => Promise<SearchResult>;
   profileSearch: (query: string, config: RecallConfig, ctx: RecallCtx) => Promise<SearchResult>;
+  resolveProject: typeof resolveProjectIdentity;
   onComplete?: (result: LocalRecallResult) => void;
 }
 
 function asLocalEvidence(hit: ReturnType<typeof fuseRoutes>[number]): LocalRecallEvidence {
-  const { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, finalRankScore, finalScore, routes, occurrences } = hit;
-  return { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, finalRankScore, finalScore, routes, occurrences };
+  const { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, routes, occurrences } = hit;
+  return { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, routes, occurrences };
 }
 
 function emptyLocalResult(reason: string, metrics: PhaseMetrics, totalMs = 0): LocalRecallResult {
@@ -213,7 +223,7 @@ async function defaultGraphSearch(query: string, config: RecallConfig, ctx: Reca
   const provider = createGraphProvider(config.graphMemory.provider, config.graphMemory.file, ctx.workspaceDir);
   try {
     const includeHistory = /(?:以前|之前|过去|原来|历史|变化|改成|变成)|\b(?:before|previously|used to|history|changed?|switched?)\b/i.test(query);
-    return await provider.retrieve(query, { maxResults: config.graphMemory.maxGraphResults, maxHops: config.graphMemory.maxHops, includeHistory });
+    return await provider.retrieve(query, { maxResults: scopedMaxResults(config.graphMemory.maxGraphResults, config), maxHops: config.graphMemory.maxHops, includeHistory });
   } finally {
     provider.close?.();
   }
@@ -303,6 +313,7 @@ async function runRecall(
     expand: dependencyOverrides.expand ?? expandQuery,
     graphSearch: dependencyOverrides.graphSearch ?? defaultGraphSearch,
     profileSearch: dependencyOverrides.profileSearch ?? defaultProfileSearch,
+    resolveProject: dependencyOverrides.resolveProject ?? resolveProjectIdentity,
     onComplete: dependencyOverrides.onComplete,
   };
   const startedAt = performance.now();
@@ -345,6 +356,14 @@ async function runRecall(
   let llmCalls = 0;
   let rescueStatus: NonNullable<TraceRecord["rescueStatus"]> = "not_run";
   let rescueRemainingMs: number | undefined;
+  let projectIdentity: ProjectIdentity = { scope: "global", reason: "not_resolved" };
+
+  const scopeResult = (result: SearchResult): SearchResult => applyProjectScope(
+    result,
+    projectIdentity,
+    config.projectScope,
+    config.graphMemory.vectorDir,
+  );
 
   const inject = (): void => {
     const injected = buildInjectedContext(fused, config.injectTokenBudget, {
@@ -394,7 +413,12 @@ async function runRecall(
       vectorMs: metrics.vectorMs, graphMs: metrics.graphMs, profileMs: metrics.profileMs,
       queryChars: rawPrompt.length, cleanedChars: cleaned.length,
       trigger: demand.reason as RecallTriggerReason, recallDepth: depth,
-      routeDecision, fallbackReason, graphTimedOut, vectorHits, graphHits, profileHits,
+      routeDecision,
+      projectScopeEnabled: config.projectScope.enabled,
+      projectId: projectIdentity.projectId,
+      projectNamespace: projectIdentity.namespace,
+      projectIdentitySource: projectIdentity.identitySource,
+      fallbackReason, graphTimedOut, vectorHits, graphHits, profileHits,
       gateDecision: demand.decision, gateStatus, gateReason,
       gateFinishReason, gateContentType, gateHasReasoningContent,
       probeTopScore, probePassed, deterministicQueries, llmCalls,
@@ -413,8 +437,8 @@ async function runRecall(
       qualityHighRawScore: config.qualityGate.highRawScore,
       qualityMediumRawScore: config.qualityGate.mediumRawScore,
       qualityMinRouteHits: config.qualityGate.minRouteHits,
-      fusionTop: fused.map(({ path, bestRawScore, rrfScore, routeHits, sourceWeight, finalRankScore, finalScore, source, routes, occurrences }) => ({
-        path, bestRawScore, rrfScore, routeHits, sourceWeight, finalRankScore, finalScore, source, routes, occurrences,
+      fusionTop: fused.map(({ path, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, source, routes, occurrences }) => ({
+        path, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, source, routes, occurrences,
       })),
       injectedChars: injected.length, injectedTokens: Math.ceil(injected.length / 4),
       injectedProfileChars: injectionLayers.profile,
@@ -430,18 +454,29 @@ async function runRecall(
     return undefined;
   }
 
+  if (config.projectScope.enabled) {
+    try {
+      projectIdentity = await dependencies.resolveProject(ctx.cwd ?? ctx.workspaceDir, config.projectScope.gitTimeoutMs);
+    } catch (error) {
+      projectIdentity = { scope: "global", reason: `resolver_error:${error instanceof Error ? error.name : "unknown"}` };
+      fallbackReason = `project:${error instanceof Error ? error.message : String(error)}`;
+    }
+  } else {
+    projectIdentity = { scope: "global", reason: "project_scope_disabled" };
+  }
+
   // Route selection has already consumed the original temporal cues. Only retrieval normalization may remove them.
   const searchQuery = normalizeRecallQuery(demand.query);
 
   if (demand.decision === "uncertain") {
     const gateStartedAt = performance.now();
     try {
-      const probe = await dependencies.search(searchQuery, {
+      const probe = scopeResult(await dependencies.search(searchQuery, {
         agent,
-        maxResults: 1,
+        maxResults: scopedMaxResults(1, config),
         minScore: config.minScore,
         timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
-      });
+      }));
       probeLiteral = probe;
       vectorHits += probe.hits.length;
       probeTopScore = probe.hits[0]?.score;
@@ -470,7 +505,7 @@ async function runRecall(
   if (config.graphMemory.enabled) {
     const profileStartedAt = performance.now();
     try {
-      const profile = await withTimeout(dependencies.profileSearch(searchQuery, config, ctx), config.graphMemory.readTimeoutMs, "profile memory read");
+      const profile = scopeResult(await withTimeout(dependencies.profileSearch(searchQuery, config, ctx), config.graphMemory.readTimeoutMs, "profile memory read"));
       profileHits = profile.hits.length;
       traceSearches.push({ route: "profile", query: searchQuery, hits: profile.hits.length, ...profile.timing });
       if (profile.hits.length > 0) auxiliaryRoutes.push({ route: "profile", weight: 1.8, result: profile });
@@ -484,7 +519,7 @@ async function runRecall(
   if (routeDecision === "graph" || routeDecision === "hybrid") {
     const graphStartedAt = performance.now();
     try {
-      const graph = await withTimeout(dependencies.graphSearch(demand.query, config, ctx), config.graphMemory.readTimeoutMs, "graph memory read");
+      const graph = scopeResult(await withTimeout(dependencies.graphSearch(demand.query, config, ctx), config.graphMemory.readTimeoutMs, "graph memory read"));
       graphHits = graph.hits.length;
       traceSearches.push({ route: "graph", query: demand.query, hits: graph.hits.length, ...graph.timing });
       if (graph.hits.length > 0) auxiliaryRoutes.push({ route: "graph", weight: 1.6, result: graph });
@@ -512,10 +547,10 @@ async function runRecall(
     let literal = probeLiteral;
     if (!literal) {
       const literalStartedAt = performance.now();
-      literal = await dependencies.search(searchQuery, {
-        agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore,
+      literal = scopeResult(await dependencies.search(searchQuery, {
+        agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: config.minScore,
         timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
-      });
+      }));
       metrics.literalMs = Math.round(performance.now() - literalStartedAt);
       metrics.searchMs += metrics.literalMs;
       vectorHits += literal.hits.length;
@@ -546,9 +581,9 @@ async function runRecall(
       const deterministicSearchStartedAt = performance.now();
       const routeBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
       const settled = await Promise.allSettled(deterministic.map(async (route): Promise<SearchRoute> => {
-        const result = await dependencies.search(route.query, {
-          agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore, timeoutMs: routeBudget,
-        });
+        const result = scopeResult(await dependencies.search(route.query, {
+          agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: config.minScore, timeoutMs: routeBudget,
+        }));
         vectorHits += result.hits.length;
         traceSearches.push({ route: route.route, query: route.query, hits: result.hits.length, ...result.timing });
         return { route: route.route, weight: route.weight, result };
@@ -599,9 +634,9 @@ async function runRecall(
             const rescueSearchStartedAt = performance.now();
             const rescueBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
             const rescueSettled = await Promise.allSettled(rescueRoutes.map(async (route): Promise<SearchRoute> => {
-              const result = await dependencies.search(route.query, {
-                agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore, timeoutMs: rescueBudget,
-              });
+              const result = scopeResult(await dependencies.search(route.query, {
+                agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: config.minScore, timeoutMs: rescueBudget,
+              }));
               vectorHits += result.hits.length;
               traceSearches.push({ route: `rescue:${route.route}`, query: route.query, hits: result.hits.length, ...result.timing });
               return { route: `rescue:${route.route}`, weight: route.weight, result };

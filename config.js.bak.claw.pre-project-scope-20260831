@@ -108,18 +108,6 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 const profileBudgets                                = {
   speed: 400,
   balanced: 800,
@@ -178,10 +166,6 @@ function retrievalModeValue(value         )                {
   return value === "adapter" ? "adapter" : "standalone";
 }
 
-function otherProjectPolicyValue(value         )                     {
-  return value === "low-weight" ? "low-weight" : "exclude";
-}
-
 function stringArray(value         , fallback          )           {
   if (!Array.isArray(value)) return [...fallback];
   const output = value
@@ -217,7 +201,6 @@ export function readConfig(pluginConfig         )               {
   const strongSources = record(strongSignal.sources);
   const qualityGate = record(raw.qualityGate);
   const semanticGate = record(raw.semanticGate);
-  const projectScope = record(raw.projectScope);
   const graphMemory = record(raw.graphMemory);
   const graphWriter = record(graphMemory.writer);
   const graphWriterCircuitBreaker = record(graphWriter.circuitBreaker);
@@ -261,15 +244,6 @@ export function readConfig(pluginConfig         )               {
       model: stringValue(semanticGate.model, stringValue(expansion.model, "deepseek-v4-flash")),
       timeoutMs: numberValue(semanticGate.timeoutMs, 1800),
       maxOutputTokens: numberValue(semanticGate.maxOutputTokens, 160),
-    },
-    projectScope: {
-      enabled: booleanValue(projectScope.enabled, true),
-      sameProjectBoost: numberValue(projectScope.sameProjectBoost, 1.5),
-      includeGlobal: booleanValue(projectScope.includeGlobal, true),
-      otherProjectPolicy: otherProjectPolicyValue(projectScope.otherProjectPolicy),
-      otherProjectWeight: numberValue(projectScope.otherProjectWeight, 0.25),
-      candidateMultiplier: Math.max(1, Math.min(5, numberValue(projectScope.candidateMultiplier, 3))),
-      gitTimeoutMs: Math.max(25, Math.min(2000, Math.round(numberValue(projectScope.gitTimeoutMs, 250)))),
     },
     graphMemory: {
       enabled: booleanValue(graphMemory.enabled, false),

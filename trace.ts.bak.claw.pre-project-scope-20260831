@@ -30,10 +30,6 @@ export interface TraceRecord {
   trigger: RecallTriggerReason;
   recallDepth: RecallDepth;
   routeDecision?: RecallRoute;
-  projectScopeEnabled?: boolean;
-  projectId?: string;
-  projectNamespace?: string;
-  projectIdentitySource?: "remote" | "root";
   fallbackReason?: string;
   graphTimedOut?: boolean;
   vectorHits?: number;
@@ -66,7 +62,7 @@ export interface TraceRecord {
   qualityMediumRawScore?: number;
   qualityMinRouteHits?: number;
   searches: Array<{ route: string; query: string; hits: number } & SearchTiming>;
-  fusionTop: Array<Pick<FusedHit, "path" | "bestRawScore" | "rrfScore" | "routeHits" | "sourceWeight" | "projectScope" | "projectWeight" | "finalRankScore" | "finalScore" | "source" | "routes" | "occurrences">>;
+  fusionTop: Array<Pick<FusedHit, "path" | "bestRawScore" | "rrfScore" | "routeHits" | "sourceWeight" | "finalRankScore" | "finalScore" | "source" | "routes" | "occurrences">>;
   injectedChars: number;
   injectedTokens: number;
   injectedProfileChars?: number;

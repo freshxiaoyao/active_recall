@@ -1,205 +1,189 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-const profileBudgets                                = {
+export type RecallProfile = "speed" | "balanced" | "deep";
+export type RecallDepth = "none" | "literal" | "balanced" | "deep";
+export type RecallTriggerMode = "always" | "on-demand" | "explicit";
+export type StructuredOutputMode = "json_object" | "json_schema";
+export type ThinkingMode = "auto" | "enabled" | "disabled" | "omit";
+export type GraphMemoryProvider = "local-sqlite" | "graphiti" | "falkordb" | "neo4j";
+export type GraphRouteMode = "auto" | "vector" | "graph" | "hybrid";
+export type GraphWriterMode = "off" | "dry-run" | "shadow" | "write";
+export type RetrievalMode = "standalone" | "adapter";
+
+export interface RecallTriggerConfig {
+  mode: RecallTriggerMode;
+  explicitPrefixes: string[];
+  suppressPrefixes: string[];
+  additionalKeywords: string[];
+}
+
+export interface ExpansionConfig {
+  endpoint: string;
+  apiKeyEnv: string;
+  model: string;
+  headers: Record<string, string>;
+  timeoutMs: number;
+  minRemainingBudgetMs: number;
+  maxOutputTokens: number;
+  responseFormat: StructuredOutputMode;
+  thinkingMode: ThinkingMode;
+  associations: { maxBalanced: number; maxDeep: number };
+}
+
+export interface SemanticGateConfig {
+  enabled: boolean;
+  model: string;
+  timeoutMs: number;
+  maxOutputTokens: number;
+}
+
+export interface StrongSignalCalibration {
+  minScore: number;
+  gap: number;
+}
+
+export interface GraphMemoryConfig {
+  enabled: boolean;
+  provider: GraphMemoryProvider;
+  file: string;
+  profileFile: string;
+  vectorDir: string;
+  readTimeoutMs: number;
+  writeTimeoutMs: number;
+  routeMode: GraphRouteMode;
+  maxGraphResults: number;
+  maxHops: number;
+  profileBudget: number;
+  vectorBudget: number;
+  graphBudget: number;
+  writer: {
+    enabled: boolean;
+    mode: GraphWriterMode;
+    model: string;
+    timeoutMs: number;
+    maxOutputTokens: number;
+    maxInputChars: number;
+    traceFile: string;
+    sessionAllowlist: string[];
+    maxEntitiesPerTurn: number;
+    maxEdgesPerTurn: number;
+    maxEpisodesPerTurn: number;
+    circuitBreaker: {
+      failureThreshold: number;
+      resetAfterMs: number;
+    };
+  };
+}
+
+export interface RecallConfig {
+  enabled: boolean;
+  retrievalMode: RetrievalMode;
+  agents: string[];
+  skipSystemEvents: boolean;
+  trigger: RecallTriggerConfig;
+  profile: RecallProfile;
+  injectTokenBudget: number;
+  maxTotalMs: number;
+  searchTimeoutMs: number;
+  expansion: ExpansionConfig;
+  semanticGate: SemanticGateConfig;
+  graphMemory: GraphMemoryConfig;
+  strongSignal: StrongSignalCalibration & {
+    enabled: boolean;
+    sources: Record<string, StrongSignalCalibration>;
+  };
+  qualityGate: {
+    /** Kept as a read alias for older callers/configuration. */
+    minBestRawScore: number;
+    highRawScore: number;
+    mediumRawScore: number;
+    minRouteHits: number;
+  };
+  rrf: { k: number; originalWeight: number; rawScoreBlend: number };
+  topK: number;
+  snippetChars: number;
+  minScore: number;
+  preferSources: Record<string, number>;
+  trace: { enabled: boolean; file: string };
+  disableActiveMemoryHint: boolean;
+}
+
+type ConfigRecord = Record<string, unknown>;
+
+const profileBudgets: Record<RecallProfile, number> = {
   speed: 400,
   balanced: 800,
   deep: 1200,
 };
 
-function record(value         )               {
+function record(value: unknown): ConfigRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value
+    ? value as ConfigRecord
     : {};
 }
 
-function stringValue(value         , fallback        )         {
+function stringValue(value: unknown, fallback: string): string {
   return typeof value === "string" && value.length > 0 ? value : fallback;
 }
 
-function numberValue(value         , fallback        )         {
+function numberValue(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
-function booleanValue(value         , fallback         )          {
+function booleanValue(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
-function profileValue(value         )                {
+function profileValue(value: unknown): RecallProfile {
   return value === "speed" || value === "deep" || value === "balanced" ? value : "balanced";
 }
 
-function triggerModeValue(value         )                    {
+function triggerModeValue(value: unknown): RecallTriggerMode {
   return value === "always" || value === "explicit" || value === "on-demand" ? value : "on-demand";
 }
 
-function structuredOutputModeValue(value         )                       {
+function structuredOutputModeValue(value: unknown): StructuredOutputMode {
   return value === "json_schema" ? "json_schema" : "json_object";
 }
 
-function thinkingModeValue(value         )               {
+function thinkingModeValue(value: unknown): ThinkingMode {
   return value === "enabled" || value === "disabled" || value === "omit" ? value : "auto";
 }
 
-function graphProviderValue(value         )                      {
+function graphProviderValue(value: unknown): GraphMemoryProvider {
   return value === "graphiti" || value === "falkordb" || value === "neo4j" ? value : "local-sqlite";
 }
 
-function graphRouteModeValue(value         )                 {
+function graphRouteModeValue(value: unknown): GraphRouteMode {
   return value === "vector" || value === "graph" || value === "hybrid" ? value : "auto";
 }
 
-function graphWriterModeValue(value         , fallback                 )                  {
+function graphWriterModeValue(value: unknown, fallback: GraphWriterMode): GraphWriterMode {
   return value === "off" || value === "dry-run" || value === "shadow" || value === "write"
     ? value
     : fallback;
 }
 
-function retrievalModeValue(value         )                {
+function retrievalModeValue(value: unknown): RetrievalMode {
   return value === "adapter" ? "adapter" : "standalone";
 }
 
-function otherProjectPolicyValue(value         )                     {
-  return value === "low-weight" ? "low-weight" : "exclude";
-}
-
-function stringArray(value         , fallback          )           {
+function stringArray(value: unknown, fallback: string[]): string[] {
   if (!Array.isArray(value)) return [...fallback];
   const output = value
-    .filter((item)                 => typeof item === "string")
+    .filter((item): item is string => typeof item === "string")
     .map((item) => item.trim())
     .filter(Boolean);
   return output.length === value.length ? output : [...fallback];
 }
 
-function stringMap(value         )                         {
-  const output                         = {};
+function stringMap(value: unknown): Record<string, string> {
+  const output: Record<string, string> = {};
   for (const [key, item] of Object.entries(record(value))) {
     if (typeof item === "string") output[key] = item;
   }
   return output;
 }
 
-function numberMap(value         , defaults                        )                         {
+function numberMap(value: unknown, defaults: Record<string, number>): Record<string, number> {
   const output = { ...defaults };
   for (const [key, item] of Object.entries(record(value))) {
     if (typeof item === "number" && Number.isFinite(item) && item >= 0) output[key] = item;
@@ -207,7 +191,7 @@ function numberMap(value         , defaults                        )            
   return output;
 }
 
-export function readConfig(pluginConfig         )               {
+export function readConfig(pluginConfig: unknown): RecallConfig {
   const raw = record(pluginConfig);
   const profile = profileValue(raw.profile);
   const trigger = record(raw.trigger);
@@ -217,7 +201,6 @@ export function readConfig(pluginConfig         )               {
   const strongSources = record(strongSignal.sources);
   const qualityGate = record(raw.qualityGate);
   const semanticGate = record(raw.semanticGate);
-  const projectScope = record(raw.projectScope);
   const graphMemory = record(raw.graphMemory);
   const graphWriter = record(graphMemory.writer);
   const graphWriterCircuitBreaker = record(graphWriter.circuitBreaker);
@@ -228,7 +211,7 @@ export function readConfig(pluginConfig         )               {
     enabled: booleanValue(raw.enabled, true),
     retrievalMode: retrievalModeValue(raw.retrievalMode),
     agents: Array.isArray(raw.agents) && raw.agents.every((item) => typeof item === "string")
-      ? raw.agents
+      ? raw.agents as string[]
       : ["main"],
     skipSystemEvents: booleanValue(raw.skipSystemEvents, true),
     trigger: {
@@ -261,15 +244,6 @@ export function readConfig(pluginConfig         )               {
       model: stringValue(semanticGate.model, stringValue(expansion.model, "deepseek-v4-flash")),
       timeoutMs: numberValue(semanticGate.timeoutMs, 1800),
       maxOutputTokens: numberValue(semanticGate.maxOutputTokens, 160),
-    },
-    projectScope: {
-      enabled: booleanValue(projectScope.enabled, true),
-      sameProjectBoost: numberValue(projectScope.sameProjectBoost, 1.5),
-      includeGlobal: booleanValue(projectScope.includeGlobal, true),
-      otherProjectPolicy: otherProjectPolicyValue(projectScope.otherProjectPolicy),
-      otherProjectWeight: numberValue(projectScope.otherProjectWeight, 0.25),
-      candidateMultiplier: Math.max(1, Math.min(5, numberValue(projectScope.candidateMultiplier, 3))),
-      gitTimeoutMs: Math.max(25, Math.min(2000, Math.round(numberValue(projectScope.gitTimeoutMs, 250)))),
     },
     graphMemory: {
       enabled: booleanValue(graphMemory.enabled, false),
@@ -309,7 +283,7 @@ export function readConfig(pluginConfig         )               {
     strongSignal: (() => {
       const minScore = numberValue(strongSignal.minScore, 0.85);
       const gap = numberValue(strongSignal.gap, 0.15);
-      const calibration = (name        , defaultMin        , defaultGap        )                          => {
+      const calibration = (name: string, defaultMin: number, defaultGap: number): StrongSignalCalibration => {
         const source = record(strongSources[name]);
         return {
           minScore: numberValue(source.minScore, Math.min(1, defaultMin)),
@@ -356,30 +330,27 @@ export function readConfig(pluginConfig         )               {
   };
 }
 
-export function maxAssociations(config              )         {
+export function maxAssociations(config: RecallConfig): number {
   return maxAssociationsForDepth(config, depthForProfile(config.profile));
 }
 
-export function depthForProfile(profile               )              {
+export function depthForProfile(profile: RecallProfile): RecallDepth {
   if (profile === "speed") return "literal";
   return profile;
 }
 
-export function maxAssociationsForDepth(config              , depth             )         {
+export function maxAssociationsForDepth(config: RecallConfig, depth: RecallDepth): number {
   if (depth === "deep") return config.expansion.associations.maxDeep;
   if (depth === "balanced") return config.expansion.associations.maxBalanced;
   return 0;
 }
 
-export function maxResultsForProfile(profile               )         {
+export function maxResultsForProfile(profile: RecallProfile): number {
   return maxResultsForDepth(depthForProfile(profile));
 }
 
-export function maxResultsForDepth(depth             )         {
+export function maxResultsForDepth(depth: RecallDepth): number {
   if (depth === "deep") return 8;
   if (depth === "literal") return 3;
   return 5;
 }
-
-
-//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active_recall\config.ts

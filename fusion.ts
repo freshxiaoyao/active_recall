@@ -13,6 +13,8 @@ export interface FusedHit {
   rrfScore: number;
   routeHits: number;
   sourceWeight: number;
+  projectScope?: "same-project" | "global" | "other-project";
+  projectWeight: number;
   finalRankScore: number;
   /** Compatibility alias for existing trace consumers. */
   finalScore: number;
@@ -121,6 +123,8 @@ export function fuseRoutes(routes: SearchRoute[], settings: FusionSettings): Fus
             current.line = hit.line;
             current.source = hit.source;
             current.sourceWeight = settings.preferSources[hit.source] ?? 1;
+            current.projectScope = hit.projectScope;
+            current.projectWeight = hit.projectWeight ?? 1;
             current.path = hit.path;
           }
           return;
@@ -131,6 +135,8 @@ export function fuseRoutes(routes: SearchRoute[], settings: FusionSettings): Fus
           rrfScore: baseContribution,
           routeHits: 1,
           sourceWeight: settings.preferSources[hit.source] ?? 1,
+          projectScope: hit.projectScope,
+          projectWeight: hit.projectWeight ?? 1,
           finalRankScore: contribution,
           finalScore: contribution,
           snippet: hit.snippet,
@@ -145,8 +151,8 @@ export function fuseRoutes(routes: SearchRoute[], settings: FusionSettings): Fus
     .map((hit) => ({
       ...hit,
       snippet: hit.snippet.slice(0, settings.snippetChars),
-      finalRankScore: hit.finalScore * hit.sourceWeight,
-      finalScore: hit.finalScore * hit.sourceWeight,
+      finalRankScore: hit.finalScore * hit.sourceWeight * hit.projectWeight,
+      finalScore: hit.finalScore * hit.sourceWeight * hit.projectWeight,
     }))
     .filter((hit) => !settings.qualityGate || passesQualityGate(hit, settings.qualityGate))
     .sort((a, b) => b.finalRankScore - a.finalRankScore || b.bestRawScore - a.bestRawScore || a.path.localeCompare(b.path))
