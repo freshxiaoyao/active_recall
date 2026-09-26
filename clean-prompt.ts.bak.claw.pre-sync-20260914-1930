@@ -1,0 +1,31 @@
+const blockPatterns = [
+  /<recall-context\b[^>]*>[\s\S]*?<\/recall-context\s*>/gi,
+  /<vault-[\w:-]+\b[^>]*>[\s\S]*?<\/vault-[\w:-]+\s*>/gi,
+];
+
+function stripLabeledBlock(input: string, label: string): string {
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const brace = new RegExp(`^${escaped}\\s*\\r?\\n?\\s*\\{[\\s\\S]*?^\\}\\s*$`, "gim");
+  const fenced = new RegExp(`^${escaped}\\s*\\r?\\n[\\s\\S]*?^\\s*(?:---|</[^>]+>)\\s*$`, "gim");
+  return input.replace(brace, "").replace(fenced, "");
+}
+
+/** Removes OpenClaw-owned prompt framing before using the message as a search query. */
+export function cleanPromptForSearch(prompt: string): string {
+  let cleaned = prompt;
+  for (const pattern of blockPatterns) cleaned = cleaned.replace(pattern, "");
+  cleaned = stripLabeledBlock(cleaned, "Sender (untrusted metadata)");
+  cleaned = stripLabeledBlock(cleaned, "OpenClaw runtime context (internal)");
+  cleaned = cleaned
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*System\s*:/i.test(line))
+    .map((line) => line.replace(/^\s*\[[A-Za-z]{3}\s+\d{4}-\d{2}-\d{2}[^\]]*(?:GMT|UTC)[^\]]*\]\s*/, ""))
+    .join("\n")
+    .replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, "\n\n")
+    .trim();
+  return cleaned;
+}
+
+export function isSystemEventPrompt(prompt: string): boolean {
+  return /\bheartbeat\b|\bsystem[- ]event\b|\bcron-triggered\b|\bagentTurn\b/i.test(prompt);
+}

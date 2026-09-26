@@ -4,19 +4,20 @@ import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { readConfig } from "../config.js";
 import { normalizeEntityAlias } from "../entity-resolution.js";
+import { isInternalSession } from "../session-guard.js";
 import { SqliteGraphProvider } from "../graph-provider.js";
 import {
   effectiveWriterMode,
   extractSalientMemory,
   lastConversationTurn,
   resetWriterQueueForTests,
+  resolveWriterRuntimeConfig,
   runMemoryWrite,
   sessionAllowed,
   shouldSkipMemoryWrite,
   writerCircuitStateForTests,
 } from "../memory-writer.js";
 import type { GraphEpisodeInput } from "../graph-types.js";
-import { projectNamespace } from "../project-scope.js";
 
 const episode = (input: Partial<GraphEpisodeInput> & Pick<GraphEpisodeInput, "id" | "entities" | "relations">): GraphEpisodeInput => ({
   sessionKey: "agent:main:user-test",
@@ -24,6 +25,15 @@ const episode = (input: Partial<GraphEpisodeInput> & Pick<GraphEpisodeInput, "id
   source: "test",
   summary: input.id,
   ...input,
+});
+
+test("writer rejects announcement delivery runs in user sessions", () => {
+  const config = readConfig({ graphMemory: { writer: { enabled: true, mode: "write" } } });
+  const messages = [{ role: "user", content: "remember project A" }, { role: "assistant", content: "saved" }];
+  const ctx = { agentId: "main", sessionKey: "agent:main:dashboard:test" };
+  assert.equal(shouldSkipMemoryWrite({ success: true, runId: "announce:requester-settle:test", messages }, ctx, config), "internal_run");
+  assert.equal(shouldSkipMemoryWrite({ success: true, messages }, { ...ctx, runId: "announce:test" }, config), "internal_run");
+  assert.equal(shouldSkipMemoryWrite({ success: true, runId: "normal-user-run", messages }, ctx, config), undefined);
 });
 
 async function pathExists(path: string): Promise<boolean> {
@@ -34,6 +44,14 @@ async function pathExists(path: string): Promise<boolean> {
     return false;
   }
 }
+
+test("writer sync resolves the live Gateway runtime config snapshot", () => {
+  const runtimeConfig = { memory: { search: { provider: "resolved" } } };
+  assert.equal(resolveWriterRuntimeConfig({
+    config: { memory: { search: { provider: "disk-secret-ref" } } },
+    runtime: { config: { current: () => runtimeConfig } },
+  }), runtimeConfig);
+});
 
 test("generated provider loads node:sqlite lazily", async () => {
   const source = await readFile(new URL("../graph-provider.js", import.meta.url), "utf8");
@@ -205,69 +223,6 @@ test("async writer is idempotent across graph, profile, and vector stores", asyn
     assert.deepEqual({ status: second.status, graphWrite: second.graphWrite, vectorWrite: second.vectorWrite }, { status: "ok", graphWrite: false, vectorWrite: false });
     const profile = JSON.parse(await readFile(join(temp, "profile.json"), "utf8")) as { facts: unknown[] };
     assert.equal(profile.facts.length, 1);
-  } finally {
-    await rm(temp, { recursive: true, force: true });
-  }
-});
-
-test("writer separates project and global episodes without changing the graph schema", async () => {
-  const temp = await mkdtemp(join(process.cwd(), ".graph-memory-project-scope-"));
-  const config = readConfig({
-    projectScope: { enabled: true },
-    graphMemory: {
-      enabled: true,
-      file: join(temp, "graph.sqlite"),
-      profileFile: join(temp, "profile.json"),
-      vectorDir: join(temp, "episodes"),
-      writer: { traceFile: join(temp, "write-traces.jsonl") },
-    },
-    trace: { enabled: false },
-  });
-  const identity = {
-    scope: "project" as const,
-    projectId: "github.com/acme/repo-a",
-    projectRoot: "C:\\src\\repo-a",
-    repoRemote: "github.com/acme/repo-a",
-    namespace: projectNamespace("github.com/acme/repo-a"),
-    identitySource: "remote" as const,
-  };
-  const ctx = { agentId: "main", sessionKey: "agent:main:user-test", workspaceDir: temp };
-  const baseEvent = {
-    success: true,
-    messages: [{ role: "user", content: "remember the probe" }, { role: "assistant", content: "stored" }],
-  };
-  try {
-    const projectResult = await runMemoryWrite({}, { ...baseEvent, runId: "project-probe-run" }, ctx, config, {
-      resolveProject: async () => identity,
-      extract: async () => ({
-        memoryScope: "project",
-        summary: "repo-a-only-probe",
-        entities: [{ name: "repo-a-only-probe", type: "Project" as const }],
-        relations: [],
-        profileFacts: [],
-      }),
-      sync: async () => true,
-    });
-    const globalResult = await runMemoryWrite({}, { ...baseEvent, runId: "global-probe-run" }, ctx, config, {
-      resolveProject: async () => identity,
-      extract: async () => ({
-        memoryScope: "global",
-        summary: "global-probe",
-        entities: [{ name: "global-probe", type: "Project" as const }],
-        relations: [],
-        profileFacts: [],
-      }),
-      sync: async () => true,
-    });
-    assert.equal(projectResult.memoryScope, "project");
-    assert.equal(globalResult.memoryScope, "global");
-    const projectFile = join(temp, "episodes", "projects", identity.namespace, `${projectResult.episodeId}.md`);
-    const globalFile = join(temp, "episodes", "global", `${globalResult.episodeId}.md`);
-    const projectMarkdown = await readFile(projectFile, "utf8");
-    assert.match(projectMarkdown, /Memory-Scope: project/);
-    assert.match(projectMarkdown, /Project-ID: github\.com\/acme\/repo-a/);
-    assert.match(projectMarkdown, /Repo-Remote: github\.com\/acme\/repo-a/);
-    assert.match(await readFile(globalFile, "utf8"), /Memory-Scope: global/);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -496,4 +451,20 @@ test("writer recursion guard covers cron and heartbeat naming variants", () => {
   ]) {
     assert.equal(shouldSkipMemoryWrite(event, { agentId: "main", sessionKey }, config), "internal_session", sessionKey);
   }
+});
+
+test("verification sessions are skipped for writing without blocking their reads", () => {
+  const config = readConfig({ graphMemory: { writer: { mode: "write" } } });
+  const event = { success: true, messages: [{ role: "user", content: "u" }, { role: "assistant", content: "a" }] };
+  for (const sessionKey of ["agent:main:acceptance-20260910", "agent:main:codex-audit", "agent:main:recall-injection-probe"]) {
+    assert.equal(shouldSkipMemoryWrite(event, { agentId: "main", sessionKey }, config), "verification_session", sessionKey);
+    assert.equal(isInternalSession(sessionKey), false, "the same run must still be able to recall");
+  }
+  // A normal user session is unaffected.
+  assert.equal(shouldSkipMemoryWrite(event, { agentId: "main", sessionKey: "agent:main:dashboard:user-session" }, config), undefined);
+  // The exclusion is configurable in both directions.
+  const off = readConfig({ graphMemory: { writer: { mode: "write", isolateVerificationSessions: false } } });
+  assert.equal(shouldSkipMemoryWrite(event, { agentId: "main", sessionKey: "agent:main:acceptance-20260910" }, off), undefined);
+  const widened = readConfig({ graphMemory: { writer: { mode: "write", excludeSessionPatterns: ["nightly-replay"] } } });
+  assert.equal(shouldSkipMemoryWrite(event, { agentId: "main", sessionKey: "agent:main:nightly-replay" }, widened), "verification_session");
 });

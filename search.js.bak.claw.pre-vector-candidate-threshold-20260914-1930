@@ -1,0 +1,286 @@
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { appendFile, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+function diagLog(message        )       {
+  try {
+    const dir = join(homedir(), ".openclaw", "workspace", "memory");
+    if (existsSync(dir)) {
+      void appendFile(join(dir, "inprocess-diag.log"), `[${new Date().toISOString()}] ${message}\n`, "utf8");
+    }
+  } catch {
+    // 诊断日志失败不阻塞主流程
+  }
+}
+
+function resolveOpenClawEntry()                                         {
+  if (process.platform !== "win32") return { file: "openclaw", prefixArgs: [] };
+  const candidates = [
+    process.env.APPDATA ? join(process.env.APPDATA, "npm", "node_modules", "openclaw", "openclaw.mjs") : "",
+    process.env.NVM_SYMLINK ? join(process.env.NVM_SYMLINK, "node_modules", "openclaw", "openclaw.mjs") : "",
+  ];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return { file: process.execPath, prefixArgs: [candidate] };
+  }
+  throw new Error("cannot resolve openclaw.mjs (npm global install not found)");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function asNumber(value         , fallback = 0)         {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function normalizeHit(value         )                   {
+  if (value === null || typeof value !== "object") return null;
+  const item = value                           ;
+  if (typeof item.path !== "string" || typeof item.snippet !== "string") return null;
+  return {
+    path: item.path,
+    line: typeof item.line === "number" ? item.line
+      : typeof item.lineStart === "number" ? item.lineStart
+      : typeof item.startLine === "number" ? item.startLine
+      : undefined,
+    score: asNumber(item.score),
+    vectorScore: typeof item.vectorScore === "number" ? item.vectorScore : undefined,
+    textScore: typeof item.textScore === "number" ? item.textScore : undefined,
+    snippet: item.snippet,
+    source: typeof item.source === "string" ? item.source : "memory",
+  };
+}
+
+function parseHits(output        )              {
+  const parsed = JSON.parse(output)           ;
+  const values = Array.isArray(parsed)
+    ? parsed
+    : parsed !== null && typeof parsed === "object" && Array.isArray((parsed                         ).results)
+      ? (parsed                          ).results
+      : [];
+  return values.map(normalizeHit).filter((hit)                   => hit !== null);
+}
+
+/** 进程内 MemorySearchResult 归一化为 SearchHit。 */
+function normalizeMemoryHit(value
+
+
+
+
+
+
+
+
+ )            {
+  return {
+    path: value.path,
+    line: value.startLine ?? value.endLine,
+    score: asNumber(value.score),
+    vectorScore: value.vectorScore,
+    textScore: value.textScore,
+    snippet: value.snippet,
+    source: typeof value.source === "string" ? value.source : "memory",
+  };
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function withTimeout   (promise            , ms        )             {
+  return new Promise   ((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), Math.max(1, ms));
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+let sdkPromise                                                                                                                                                            ;
+
+/** 动态加载 gateway 内已缓存的 memory SDK（先 bare specifier，再绝对路径；挂起时 3s 超时放弃）。 */
+function loadInProcessSdk()                                                                                                                                                 {
+  if (sdkPromise === undefined) {
+    sdkPromise = (async () => {
+      try {
+        let mod                                                        ;
+        try {
+          mod = await withTimeout(import("openclaw/plugin-sdk/memory-host-search"), 3000)                                              ;
+        } catch (error) {
+          diagLog(`bare import failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (!mod?.getActiveMemorySearchManager) {
+          const dist = process.env.APPDATA ? join(process.env.APPDATA, "npm", "node_modules", "openclaw", "dist") : "";
+          if (dist && existsSync(join(dist, "plugin-sdk", "memory-host-search.js"))) {
+            mod = await withTimeout(import(pathToFileURL(join(dist, "plugin-sdk", "memory-host-search.js")).href), 3000)                                              ;
+          }
+        }
+        const fn = mod?.getActiveMemorySearchManager;
+        diagLog(`sdk import ok, fn=${typeof fn}`);
+        return typeof fn === "function"
+          ? { getActiveMemorySearchManager: fn                                                                                                                                   }
+          : null;
+      } catch (error) {
+        diagLog(`sdk import failed: ${error instanceof Error ? error.message : String(error)}`);
+        return null;
+      }
+    })();
+  }
+  return sdkPromise;
+}
+
+/** 进程内检索：gateway 已注册的 memory runtime 直接复用（无 spawn，~毫秒级）。失败或超时返回 null。 */
+async function tryInProcessSearch(query        , options               , timeoutMs        )                               {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`memory search timeout after ${timeoutMs}ms`)), Math.max(1, timeoutMs));
+  try {
+    return await withTimeout(inProcessSearchInner(query, options, controller.signal), timeoutMs);
+  } catch (error) {
+    diagLog(`in-process failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function inProcessSearchInner(query        , options               , signal              )                               {
+  try {
+    const sdk = await loadInProcessSdk();
+    if (!sdk) { diagLog("sdk unavailable"); return null; }
+    const cfgPath = join(homedir(), ".openclaw", "openclaw.json");
+    if (!existsSync(cfgPath)) { diagLog("cfg missing"); return null; }
+    const cfg = JSON.parse(await readFile(cfgPath, "utf8"))           ;
+    const { manager, error: managerError } = await sdk.getActiveMemorySearchManager({ cfg, agentId: options.agent });
+    if (managerError) diagLog(`manager error: ${managerError}`);
+    if (!manager?.search) { diagLog("manager.search missing"); return null; }
+    const startedAt = performance.now();
+    const results = await manager.search(query, { maxResults: options.maxResults, minScore: options.minScore, signal });
+    const elapsed = Math.round(performance.now() - startedAt);
+    diagLog(`in-process ok: ${elapsed}ms hits=${(results ?? []).length}`);
+    return {
+      hits: (results ?? []).map(normalizeMemoryHit),
+      timing: { spawnMs: 0, searchMs: elapsed, totalMs: elapsed },
+      rawOutput: "",
+    };
+  } catch (error) {
+    diagLog(`inner failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+/** Best-effort background indexing after a writer adds a memory markdown episode. */
+export async function triggerMemorySync(agentId        )                   {
+  const sdk = await loadInProcessSdk();
+  if (!sdk) return false;
+  const cfgPath = join(homedir(), ".openclaw", "openclaw.json");
+  if (!existsSync(cfgPath)) return false;
+  const cfg = JSON.parse(await readFile(cfgPath, "utf8"))           ;
+  const { manager } = await sdk.getActiveMemorySearchManager({ cfg, agentId });
+  if (!manager?.sync) return false;
+  await manager.sync({ reason: "active-recall-graph-writer" });
+  return true;
+}
+
+/** 先走进程内（gateway 已缓存 manager），失败回退 CLI shell-out。 */
+export async function memorySearch(query        , options               )                        {
+  const startedAt = performance.now();
+  const inProcessBudget = Math.min(options.timeoutMs, Math.max(250, Math.round(options.timeoutMs * 0.6)));
+  const inProcess = await tryInProcessSearch(query, options, inProcessBudget);
+  if (inProcess) return inProcess;
+  const remaining = Math.floor(options.timeoutMs - (performance.now() - startedAt));
+  if (remaining <= 0) throw new Error(`memory search timeout after ${options.timeoutMs}ms`);
+  return cliMemorySearch(query, { ...options, timeoutMs: remaining });
+}
+
+/** Runs the supported CLI with an argv query, never stdin. */
+function cliMemorySearch(query        , options               )                        {
+  const startedAt = performance.now();
+  let spawnedAt                    ;
+  const override = options.command;
+  const { file: command, prefixArgs } = override
+    ? { file: override, prefixArgs: []             }
+    : resolveOpenClawEntry();
+  const args = [
+    ...prefixArgs, "memory", "search", "--query", query, "--agent", options.agent,
+    "--max-results", String(options.maxResults), "--min-score", String(options.minScore), "--json",
+  ];
+  return new Promise((resolve, reject) => {
+    const child = execFile(command, args, {
+      encoding: "utf8",
+      timeout: options.timeoutMs,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      const finishedAt = performance.now();
+      if (error) {
+        const detail = stderr ? `${error.message}: ${stderr}` : error.message;
+        reject(new Error(detail, { cause: error }));
+        return;
+      }
+      try {
+        const rawOutput = String(stdout).replace(/^\uFEFF/, "");
+        const spawnMs = Math.max(0, (spawnedAt ?? finishedAt) - startedAt);
+        resolve({
+          hits: parseHits(rawOutput),
+          timing: {
+            spawnMs: Math.round(spawnMs),
+            searchMs: Math.round(Math.max(0, finishedAt - (spawnedAt ?? startedAt))),
+            totalMs: Math.round(finishedAt - startedAt),
+          },
+          rawOutput,
+        });
+      } catch (parseError) {
+        reject(parseError);
+      }
+    });
+    child.once("spawn", () => { spawnedAt = performance.now(); });
+  });
+}
+
+
+//# sourceURL=C:\Users\lenovo\.openclaw\workspace\plugins\active_recall\search.ts

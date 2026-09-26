@@ -7,8 +7,24 @@ export interface DeterministicSearchRoute {
 }
 
 const temporalCuePattern = /(?:之前|上次|上回|以前|先前|过去|现在|目前|后来|原来|当时|曾经|last\s+time|previously|before|earlier|now|currently|later|used\s+to)/giu;
-const recallWrapperPattern = /(?:请|帮我|麻烦)?(?:回忆一下|回忆|查找?记忆|查询记忆|还记得|记得)|\b(?:do\s+you\s+(?:still\s+)?remember|can\s+you\s+recall|recall|search\s+(?:your\s+)?memor(?:y|ies))\b/giu;
+/**
+ * A recall wrapper is a *leading* politeness/recall phrase (`你记得…`, `请帮我回忆一下…`).
+ * It must be anchored: unanchored, it also ate the verb out of an ordinary question
+ * (`你记得 X 吗` -> `你 X 吗`, measured 2026-09-10).
+ */
+const recallWrapperPattern = /^\s*(?:(?:请问|你|您|请|帮我|麻烦)\s*){0,2}(?:回忆一下|回忆|查找?记忆|查询记忆|还记得|记得)|^\s*(?:do\s+you\s+(?:still\s+)?remember|can\s+you\s+recall|recall|search\s+(?:your\s+)?memor(?:y|ies))\b/iu;
 const questionNoisePattern = /(?:请问|能不能|可以吗|告诉我|帮我查|是什么|怎么样|如何|有哪些|吗|呢)|\b(?:please|tell\s+me|what\s+(?:is|was|are|were)|how\s+(?:is|was|are|were)|can\s+you)\b/giu;
+/** Answer-shaping directives address the responder, never retrieval; they must not pollute the search query. */
+const answerInstructionPattern = /(?:引用本轮证据即可|只引用(?:本轮)?证据|仅引用(?:本轮)?证据|只(?:能)?根据(?:本轮)?证据回答|不(?:要)?(?:调用|使用|用)(?:任何|所有|其它|其他|别的)?工具|禁止(?:调用|使用|用)(?:任何|所有|其它|其他|别的)?工具|无需(?:调用|使用|用)(?:任何|所有|其它|其他|别的)?工具|原样[\s*_`~>·-]{0,6}?(?:贴出|贴|粘贴|复述|输出|复制)|只(?:回答|回复|输出)[^，。！？；\n]{0,12})|\b(?:do\s+not|don'?t|no)\s+(?:call|use)\s+(?:any\s+)?tools?\b|\b(?:answer|reply)\s+(?:only\s+)?(?:from|using)\s+(?:the\s+)?evidence\b|\bonly\s+(?:cite|use|quote)\s+(?:the\s+)?evidence\b/giu;
+/** Retrieval queries are embedded and ranked; unbounded prompts dilute the embedding and blow the search budget. */
+const MAX_RETRIEVAL_QUERY_CHARS = 400;
+const RETRIEVAL_QUERY_EDGE_CHARS = 180;
+function boundRetrievalQuery(query: string): string {
+  if (query.length <= MAX_RETRIEVAL_QUERY_CHARS) return query;
+  const head = query.slice(0, RETRIEVAL_QUERY_EDGE_CHARS).trim();
+  const tail = query.slice(-RETRIEVAL_QUERY_EDGE_CHARS).trim();
+  return `${head} ${tail}`.replace(/\s+/g, " ").trim();
+}
 
 function queryKey(query: string): string {
   return query.replace(/\s+/g, " ").trim().toLocaleLowerCase();
@@ -25,10 +41,14 @@ export function normalizeRecallQuery(query: string): string {
   const normalized = original
     .replace(temporalCuePattern, " ")
     .replace(recallWrapperPattern, " ")
+    .replace(answerInstructionPattern, " ")
+    // Chat emphasis must not survive into an embedded query: `**原样**贴出` broke token
+    // adjacency and defeated the instruction pattern above (measured 2026-09-10).
+    .replace(/\*{1,3}|`{1,3}|~{2}/g, " ")
     .replace(/[，。！？；：、,.!?;:()[\]{}]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return normalized.length >= 2 ? normalized : original;
+  return boundRetrievalQuery(normalized.length >= 2 ? normalized : original);
 }
 
 function focusedQuery(query: string): string {

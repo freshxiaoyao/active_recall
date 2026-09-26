@@ -28,6 +28,7 @@ export type RecallDemand =
 const memoryIntentPatterns = [
   /(?:你|还|是否|能不能|可以).{0,6}记得/,
   /(?:从|查|搜).{0,8}(?:记忆|历史记录)/,
+  /(?<!不)[仅只].{0,2}(?:根据|基于|依据).{0,4}(?:记忆|历史记录)(?:回答|说明|总结|判断)?/,
   /回忆(?:一下|下)?(?:我们|之前|上次|过去)?/,
   /\b(?:do you|can you|you)\s+(?:still\s+)?remember\b/i,
   /\brecall\s+(?:what|when|how|our|the)\b/i,
@@ -42,6 +43,12 @@ const historicalReferencePatterns = [
   /(?:我们|咱们|你|我).{0,12}(?:说过|聊过|提过|做过|改过|定过|决定过|约定过|讨论过|说的|聊的|提的|做的|改的|定的|决定的|约定的|讨论的).{0,24}(?:之前|上次|上回|以前|先前|当时|曾经)/,
   /(?:继续|接着)(?:上次|之前|先前|昨天)/,
   /(?:我|我们)?(?:之前|一贯|平时|原来)(?:的)?(?:偏好|习惯|风格|约定|方案|配置)/,
+  // Ordinary recollection of our own prior work; the strict verb lists above missed
+  // "我们之前是怎么设计 X 的" and "上次我们决定用哪个检索方案" (audit 2026-09-10).
+  // Anchored on 我们/咱们 so generic history questions keep the zero-work path.
+  /(?:我们|咱们).{0,16}(?:之前|上次|上回|先前|以前|当时).{0,24}(?:怎么|如何|怎样|为什么|咋)/,
+  /(?:之前|上次|上回|先前|当时).{0,16}(?:我们|咱们).{0,24}(?:怎么|如何|怎样|为什么|咋)/,
+  /(?:之前|上次|上回|先前|当时).{0,16}(?:我们|咱们|你|我).{0,16}(?:决定|定了|选定|选了|挑了|用了|选择|方案|结论|约定)/,
   /\b(?:last time|previously|in (?:an|our) earlier session)\b.{0,80}\b(?:(?:we|i)\b.{0,40}\b(?:agreed|decided|discussed|worked|changed|configured)|you\b.{0,40}\b(?:said|told|recommended|changed|configured))\b/i,
   /\b(?:(?:we|i)\b.{0,80}\b(?:agree|agreed|decide|decided|discuss|discussed|work|worked|change|changed|configure|configured)|you\b.{0,80}\b(?:say|said|tell|told|recommend|recommended|change|changed|configure|configured))\b.{0,40}\b(?:before|previously|last time)\b/i,
   /\b(?:my|our)\s+(?:usual|saved|previous)\s+(?:preferences?|style|settings?)\b/i,
@@ -53,7 +60,7 @@ const ambiguousReferencePatterns = [
 ];
 
 const uncertainContextPatterns = [
-  /(?:这个|当前|现有|目前|继续|接着|还是|再|重新).{0,24}(?:项目|插件|配置|方案|代码|实现|流程|任务|调优)/,
+  /(?:这个|当前|现有|目前|继续|接着|还是|再|重新).{0,24}(?:项目|插件|配置|方案|代码|实现|流程|任务|调优|进度|进展|修复|开发|优化)/,
   /(?:帮我|就按|照着|按照)(?:这个|上面|刚才|把)?[^。！？\n]{0,20}(?:落地|继续|修改|调整|优化|完善|实现)/,
   /(?:我的|我们的|适合我|按我的|当前配置|现有配置|已有方案)/,
   /\b(?:my|our|this|the current)\s+(?:project|plugin|setup|configuration|config|workflow|implementation|codebase)\b/i,

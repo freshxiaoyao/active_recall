@@ -1,4 +1,6 @@
 import type { SearchHit, SearchResult } from "./search.js";
+import { supportingExcerpt } from "./snippet-quality.js";
+import { isVerificationSession } from "./session-guard.js";
 
 export interface SearchRoute {
   route: string;
@@ -10,6 +12,10 @@ export interface FusedHit {
   path: string;
   line?: number;
   bestRawScore: number;
+  /** Vector similarity of the same hit that holds bestRawScore; stable across weight configs. */
+  bestVectorScore: number;
+  /** Host provenance (epoch ms) of the best-scoring hit, when the source exposes it. */
+  observedAt?: number;
   rrfScore: number;
   routeHits: number;
   sourceWeight: number;
@@ -22,16 +28,21 @@ export interface FusedHit {
   source: string;
   routes: string[];
   occurrences: number;
+  /**
+   * Best substantive excerpt seen for this document across routes. Used only when the
+   * best-scoring chunk is frontmatter/document description (round-2 audit).
+   */
 }
 
 export interface FusionSettings {
+  query?: string;
   k: number;
   preferSources: Record<string, number>;
   snippetChars: number;
   topK: number;
   minRawScore?: number;
   rawScoreBlend?: number;
-  qualityGate?: { highRawScore: number; mediumRawScore: number; minRouteHits: number };
+  qualityGate?: { highRawScore: number; mediumRawScore: number; minRouteHits: number; metric?: "blended" | "vector" };
 }
 
 export function canonicalPath(path: string): string {
@@ -89,11 +100,12 @@ export function isStrongSignal(
 }
 
 export function passesQualityGate(
-  hit: Pick<FusedHit, "bestRawScore" | "routeHits">,
-  gate: { highRawScore: number; mediumRawScore: number; minRouteHits: number },
+  hit: Pick<FusedHit, "bestRawScore" | "bestVectorScore" | "routeHits">,
+  gate: { highRawScore: number; mediumRawScore: number; minRouteHits: number; metric?: "blended" | "vector" },
 ): boolean {
-  return hit.bestRawScore >= gate.highRawScore
-    || (hit.bestRawScore >= gate.mediumRawScore && hit.routeHits >= gate.minRouteHits);
+  const score = gate.metric === "vector" ? hit.bestVectorScore : hit.bestRawScore;
+  return score >= gate.highRawScore
+    || (score >= gate.mediumRawScore && hit.routeHits >= gate.minRouteHits);
 }
 
 export function successfulRoutes(settled: PromiseSettledResult<SearchRoute>[]): SearchRoute[] {
@@ -103,7 +115,18 @@ export function successfulRoutes(settled: PromiseSettledResult<SearchRoute>[]): 
 export function fuseRoutes(routes: SearchRoute[], settings: FusionSettings): FusedHit[] {
   const byPath = new Map<string, FusedHit>();
   for (const route of routes) {
-    distinctPathHits(route.result.hits, settings.minRawScore ?? Number.NEGATIVE_INFINITY)
+    // Select a usable chunk BEFORE collapsing a file. Never lend a metadata chunk's
+    // score or locator to a different body excerpt.
+    const eligible = route.result.hits.flatMap((hit) => {
+      const session = hit.snippet.match(/^\s*-\s*Session:\s*(.+)$/m)?.[1];
+      if (session && isVerificationSession(session.trim())) return [];
+      // Consolidation candidates are unconfirmed derived material, not primary evidence.
+      if (/^\s*(?:-\s*)?Candidate\s*:/im.test(hit.snippet)) return [];
+      const excerpt = supportingExcerpt(hit.snippet, settings.snippetChars, settings.query);
+      if (!excerpt) return [];
+      return [{ ...hit, snippet: excerpt.text, line: hit.line === undefined ? undefined : hit.line + excerpt.skippedLines }];
+    });
+    distinctPathHits(eligible, settings.minRawScore ?? Number.NEGATIVE_INFINITY)
       .forEach(({ hit, occurrences }, index) => {
         const key = canonicalPath(hit.path);
         const current = byPath.get(key);
@@ -119,6 +142,7 @@ export function fuseRoutes(routes: SearchRoute[], settings: FusionSettings): Fus
           current.occurrences += occurrences;
           if (hit.score > current.bestRawScore) {
             current.bestRawScore = hit.score;
+            current.bestVectorScore = hit.vectorScore ?? 0;
             current.snippet = hit.snippet;
             current.line = hit.line;
             current.source = hit.source;
@@ -126,12 +150,15 @@ export function fuseRoutes(routes: SearchRoute[], settings: FusionSettings): Fus
             current.projectScope = hit.projectScope;
             current.projectWeight = hit.projectWeight ?? 1;
             current.path = hit.path;
+            current.observedAt = hit.observedAt;
           }
           return;
         }
         byPath.set(key, {
           path: hit.path,
           bestRawScore: hit.score,
+          bestVectorScore: hit.vectorScore ?? 0,
+          ...(hit.observedAt === undefined ? {} : { observedAt: hit.observedAt }),
           rrfScore: baseContribution,
           routeHits: 1,
           sourceWeight: settings.preferSources[hit.source] ?? 1,
@@ -148,12 +175,13 @@ export function fuseRoutes(routes: SearchRoute[], settings: FusionSettings): Fus
       });
   }
   return [...byPath.values()]
-    .map((hit) => ({
-      ...hit,
-      snippet: hit.snippet.slice(0, settings.snippetChars),
-      finalRankScore: hit.finalScore * hit.sourceWeight * hit.projectWeight,
-      finalScore: hit.finalScore * hit.sourceWeight * hit.projectWeight,
-    }))
+    .map((hit) => {
+      return {
+        ...hit,
+        finalRankScore: hit.finalScore * hit.sourceWeight * hit.projectWeight,
+        finalScore: hit.finalScore * hit.sourceWeight * hit.projectWeight,
+      };
+    })
     .filter((hit) => !settings.qualityGate || passesQualityGate(hit, settings.qualityGate))
     .sort((a, b) => b.finalRankScore - a.finalRankScore || b.bestRawScore - a.bestRawScore || a.path.localeCompare(b.path))
     .slice(0, settings.topK);

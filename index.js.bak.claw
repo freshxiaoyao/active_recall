@@ -1,15 +1,27 @@
 import { cleanPromptForSearch, isSystemEventPrompt } from "./clean-prompt.js";
 import { depthForProfile, maxAssociationsForDepth, maxResultsForDepth, readConfig } from "./config.js";
 import { evaluateRecallDemand } from "./demand.js";
+import { buildDeterministicSearchRoutes, normalizeRecallQuery, queryKey } from "./deterministic-expansion.js";
 import { buildExpansionSearchRoutes, expandQuery } from "./expansion.js";
 import { fuseRoutes, isStrongSignal, successfulRoutes } from "./fusion.js";
 import { createGraphProvider } from "./graph-provider.js";
-import { enqueueMemoryWrite } from "./memory-writer.js";
+import { effectiveWriterMode, enqueueMemoryWrite } from "./memory-writer.js";
 import { ProfileMemoryStore } from "./profile-memory.js";
-import { evaluateSemanticRecall } from "./semantic-gate.js";
-import { isInternalSession } from "./session-guard.js";
-import { memorySearch } from "./search.js";
+import { applyProjectScope, resolveProjectIdentity } from "./project-scope.js";
+import {
+  LOCAL_RETRIEVER_API_VERSION,
+  publishLocalRetriever,
+  unpublishLocalRetriever,
+} from "./local-retriever.js";
+import { isInternalSession, isVerificationSession } from "./session-guard.js";
+import { memorySearch, setWarmupContext, warmMemorySearch } from "./search.js";
 import { writeTrace } from "./trace.js";
+import { excludeVerificationEpisodes } from "./derived-evidence.js";
+import { hydrateWikiExcerpts } from "./wiki-excerpts.js";
+
+
+
+
 
 
 
@@ -58,6 +70,7 @@ function promptText(event         )         {
 
 
 
+
 function agentId(ctx           )         {
   return typeof ctx?.agentId === "string" && ctx.agentId ? ctx.agentId : "main";
 }
@@ -65,6 +78,7 @@ function agentId(ctx           )         {
 function sessionKey(ctx           )         {
   return typeof ctx?.sessionKey === "string" && ctx.sessionKey ? ctx.sessionKey : "unknown";
 }
+
 
 
 
@@ -89,6 +103,7 @@ function buildInjectedContext(hits                               , budget       
   const maxChars = Math.max(0, budget * 4);
   const limits               = layerBudgets ?? { profile: budget, vector: budget, graph: budget };
   const layerChars = { profile: 0, vector: 0, graph: 0 };
+  const selectedHits = []                                 ;
   let output = prefix;
   for (const hit of hits) {
     const layer = hitLayer(hit.source);
@@ -98,8 +113,9 @@ function buildInjectedContext(hits                               , budget       
     if (output.length + line.length + suffix.length > maxChars) break;
     output += line;
     layerChars[layer] += line.length;
+    selectedHits.push(hit);
   }
-  return { context: output === prefix ? undefined : `${output}${suffix}`, layerChars };
+  return { context: output === prefix ? undefined : `${output}${suffix}`, layerChars, selectedHits };
 }
 
 function injectContext(hits                               , budget        , layerBudgets               )                     {
@@ -112,6 +128,41 @@ function remainingMs(startedAt        , limit        )         {
 
 function boundedTimeout(configuredMs        , remaining        )         {
   return Math.max(1, Math.min(configuredMs, Math.max(0, remaining)));
+}
+
+/**
+ * A cold in-process memory manager can miss the first deadline and answer the next call.
+ * Measured 2026-09-10: first search after idle timed out at 2200ms, the immediate retry
+ * returned in 1210ms — the whole turn used to fail open and inject nothing. Retry once on a
+ * timeout while the run still has budget; never retry other failures and never retry twice.
+ */
+const COLD_RETRY_MIN_MS = 1500;
+
+function coldRetrySearch(
+  dependencies                    ,
+  query        ,
+  options                                             ,
+  remaining              ,
+  stats                 ,
+)                                           {
+  if (stats) stats.attempts += 1;
+  return dependencies.search(query, options).catch((error         ) => {
+    if (!(error instanceof Error) || !/timeout/i.test(error.message)) throw error;
+    const budget = remaining();
+    if (budget < COLD_RETRY_MIN_MS) throw error;
+    if (stats) stats.retries += 1;
+    return dependencies.search(query, { ...options, timeoutMs: boundedTimeout(budget, budget) })
+      .then((value) => {
+        if (stats) stats.rescued += 1;
+        return value;
+      });
+  });
+}
+
+function scopedMaxResults(base        , config              )         {
+  return config.projectScope.enabled
+    ? Math.min(20, Math.max(base, Math.ceil(base * config.projectScope.candidateMultiplier)))
+    : base;
 }
 
 function withTimeout   (promise            , timeoutMs        , label        )             {
@@ -137,13 +188,25 @@ function emptyFusionStatus(routes               )                              {
   return routes.some((route) => route.result.hits.length > 0) ? "low_quality" : "no_result";
 }
 
-function fuseForRecall(routes               , config              )                                {
+function resolveCandidateMinScore(config              )         {
+  // memory-core filters on its blended hybrid score before returning vectorScore.
+  // Keep the legacy blended-score floor unless the final gate explicitly owns
+  // quality with the vector metric; then retrieve broadly and gate afterwards.
+  return config.qualityGate.metric === "vector"
+    ? Math.min(config.minScore, config.candidateMinScore)
+    : config.minScore;
+}
+
+function fuseForRecall(routes               , config              , query         )                                {
   return fuseRoutes(routes, {
+    query,
     k: config.rrf.k,
     preferSources: { profile: 1.2, graph: 1.1, ...config.preferSources },
     snippetChars: config.snippetChars,
     topK: config.topK,
-    minRawScore: config.qualityGate.mediumRawScore,
+    // A vector-metric gate must not pre-filter on the blended score: keyword-only hits
+    // carry blended ~0.29 but vector 0, and strong semantic hits can carry blended < 0.5.
+    minRawScore: config.qualityGate.metric === "vector" ? 0 : config.qualityGate.mediumRawScore,
     rawScoreBlend: config.rrf.rawScoreBlend,
     qualityGate: config.qualityGate,
   });
@@ -173,11 +236,72 @@ function queueTrace(api           , trace             , config              , ct
 
 
 
+
+function resolveRuntimeConfig(api           )          {
+  try {
+    return api.runtime?.config?.current?.() ?? api.config;
+  } catch {
+    return api.config;
+  }
+}
+
+/** 预热只接受 Gateway 已解析的 runtime config；拿不到就跳过（宁可不预热，也不用未解析 SecretRef 建错 manager）。 */
+function resolveWarmupRuntimeConfig(api           )          {
+  try {
+    return api.runtime?.config?.current?.();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Gateway 重启后的冷态 manager 预热：延迟执行，不阻塞插件注册与首轮提示构建。 */
+function scheduleMemoryWarmup(api           , config              )       {
+  const agent = (Array.isArray(config.agents) ? config.agents.find((id) => typeof id === "string" && id.trim()) : undefined) ?? "main";
+  // 立即注册上下文，让探针超时触发的自愈预热也能工作
+  setWarmupContext({ agent, resolveRuntimeConfig: () => resolveWarmupRuntimeConfig(api) });
+  const timer = setTimeout(() => { warmMemorySearch("gateway-start"); }, 5000);
+  timer.unref?.();
+}
+
+export function createMemorySearchDependency(
+  api           ,
+  search                      = memorySearch,
+)                      {
+  return (query, options) => search(query, { ...options, runtimeConfig: resolveRuntimeConfig(api) });
+}
+
+function asLocalEvidence(hit                                       )                      {
+  const { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, routes, occurrences, observedAt } = hit;
+  return { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, routes, occurrences, ...(observedAt === undefined ? {} : { observedAt }) };
+}
+
+function emptyLocalResult(reason        , metrics              , totalMs = 0)                    {
+  return {
+    schemaVersion: LOCAL_RETRIEVER_API_VERSION,
+    status: "skipped_guard",
+    decision: "no",
+    reason,
+    depth: "none",
+    routeDecision: "none",
+    rankedHits: [],
+    selectedHits: [],
+    diagnostics: {
+      totalMs,
+      ...metrics,
+      vectorHits: 0,
+      graphHits: 0,
+      profileHits: 0,
+      deterministicQueries: 0,
+      llmCalls: 0,
+    },
+  };
+}
+
 async function defaultGraphSearch(query        , config              , ctx           )                        {
   const provider = createGraphProvider(config.graphMemory.provider, config.graphMemory.file, ctx.workspaceDir);
   try {
     const includeHistory = /(?:以前|之前|过去|原来|历史|变化|改成|变成)|\b(?:before|previously|used to|history|changed?|switched?)\b/i.test(query);
-    return await provider.retrieve(query, { maxResults: config.graphMemory.maxGraphResults, maxHops: config.graphMemory.maxHops, includeHistory });
+    return await provider.retrieve(query, { maxResults: scopedMaxResults(config.graphMemory.maxGraphResults, config), maxHops: config.graphMemory.maxHops, includeHistory });
   } finally {
     provider.close?.();
   }
@@ -193,6 +317,68 @@ export function resolveRecallRoute(route             , config              )    
   return config.graphMemory.routeMode === "auto" ? route : config.graphMemory.routeMode;
 }
 
+
+
+
+
+
+
+
+
+
+
+function resolveLocalPlanState(event         , ctx           , config              )                 {
+  const rawPrompt = promptText(event);
+  const cleaned = cleanPromptForSearch(rawPrompt);
+  const agent = agentId(ctx);
+  const session = sessionKey(ctx);
+  const guardReason = !cleaned
+    ? "empty_prompt"
+    : isInternalSession(session)
+      ? "internal_session"
+      : config.skipSystemEvents && isSystemEventPrompt(rawPrompt)
+        ? "system_event"
+        : !config.agents.includes(agent)
+          ? "agent_filtered"
+          : undefined;
+  if (guardReason) {
+    return {
+      rawPrompt,
+      cleaned,
+      agent,
+      session,
+      guardReason,
+      plan: {
+        schemaVersion: LOCAL_RETRIEVER_API_VERSION,
+        decision: "no",
+        reason: guardReason,
+        depth: "none",
+        routeDecision: "none",
+      },
+    };
+  }
+  const demand = evaluateRecallDemand(cleaned, config.trigger);
+  const noRecall = demand.decision === "no";
+  return {
+    rawPrompt,
+    cleaned,
+    agent,
+    session,
+    demand,
+    plan: {
+      schemaVersion: LOCAL_RETRIEVER_API_VERSION,
+      decision: demand.decision,
+      reason: demand.reason,
+      depth: noRecall ? "none" : demand.depth ?? depthForProfile(config.profile),
+      routeDecision: noRecall ? "none" : resolveRecallRoute(demand.route, config),
+    },
+  };
+}
+
+export function planLocalRecall(event         , ctx           , config              )                  {
+  return resolveLocalPlanState(event, ctx, config).plan;
+}
+
 async function runRecall(
   api           ,
   event         ,
@@ -200,40 +386,71 @@ async function runRecall(
   config              ,
   dependencyOverrides                              = {},
 )                                                  {
+  const baseSearch = createMemorySearchDependency(api);
   const dependencies                     = {
-    search: dependencyOverrides.search ?? memorySearch,
+    search: dependencyOverrides.search ?? (async (query, options) => {
+      const result = await baseSearch(query, options);
+      if (!ctx.workspaceDir) return result;
+      const clean = await excludeVerificationEpisodes(result, ctx.workspaceDir, config.graphMemory.vectorDir);
+      return hydrateWikiExcerpts(clean, ctx.workspaceDir);
+    }),
     expand: dependencyOverrides.expand ?? expandQuery,
-    semanticGate: dependencyOverrides.semanticGate ?? evaluateSemanticRecall,
     graphSearch: dependencyOverrides.graphSearch ?? defaultGraphSearch,
     profileSearch: dependencyOverrides.profileSearch ?? defaultProfileSearch,
+    resolveProject: dependencyOverrides.resolveProject ?? resolveProjectIdentity,
+    onComplete: dependencyOverrides.onComplete,
   };
   const startedAt = performance.now();
   const metrics               = { literalMs: 0, gateMs: 0, expansionMs: 0, searchMs: 0, fusionMs: 0, vectorMs: 0, graphMs: 0, profileMs: 0 };
-  const rawPrompt = promptText(event);
-  const cleaned = cleanPromptForSearch(rawPrompt);
-  const agent = agentId(ctx);
-  const session = sessionKey(ctx);
-  if (!cleaned || isInternalSession(session) || (config.skipSystemEvents && isSystemEventPrompt(rawPrompt)) || !config.agents.includes(agent)) return undefined;
+  const coldRetry                 = { attempts: 0, retries: 0, rescued: 0 };
+  const candidateMinScore = resolveCandidateMinScore(config);
+  const localPlan = resolveLocalPlanState(event, ctx, config);
+  const { rawPrompt, cleaned, agent, session } = localPlan;
+  if (localPlan.guardReason) {
+    try {
+      dependencies.onComplete?.(emptyLocalResult(localPlan.guardReason, metrics, Math.round(performance.now() - startedAt)));
+    } catch (error) {
+      api.logger?.warn?.(`active-recall adapter capture failed: ${String(error)}`);
+    }
+    return undefined;
+  }
 
-  const demand = evaluateRecallDemand(cleaned, config.trigger);
-  let routeDecision = resolveRecallRoute(demand.route, config);
-  let depth              = demand.depth ?? depthForProfile(config.profile);
-  let gateStatus                                 = "not_run";
+  const demand = localPlan.demand                                           ;
+  let routeDecision = localPlan.plan.routeDecision;
+  let depth              = localPlan.plan.depth;
+  let gateStatus                                         = "not_run";
   let gateReason = demand.reason;
   let gateFinishReason                    ;
   let gateContentType                    ;
   let gateHasReasoningContent                     ;
-  const traceSearches                                                                                                            = [];
+  const traceSearches                                                                                                                                = [];
   let expansionStatus                                                                                       = "not_run";
   let expansionDiagnostics                                  ;
   let fused = []                                 ;
+  let qualityCandidates                                                = [];
   let prependContext                    ;
   let injectionLayers = { profile: 0, vector: 0, graph: 0 };
+  let selectedHits = []                                 ;
   let graphTimedOut = false;
   let fallbackReason                    ;
   let vectorHits = 0;
   let graphHits = 0;
   let profileHits = 0;
+  let probeTopScore                    ;
+  let probePassed                     ;
+  let probeLiteral                          ;
+  let deterministicQueries = 0;
+  let llmCalls = 0;
+  let rescueStatus                                           = "not_run";
+  let rescueRemainingMs                    ;
+  let projectIdentity                  = { scope: "global", reason: "not_resolved" };
+
+  const scopeResult = (result              )               => applyProjectScope(
+    result,
+    projectIdentity,
+    config.projectScope,
+    config.graphMemory.vectorDir,
+  );
 
   const inject = ()       => {
     const injected = buildInjectedContext(fused, config.injectTokenBudget, {
@@ -243,12 +460,39 @@ async function runRecall(
     });
     prependContext = injected.context;
     injectionLayers = injected.layerChars;
+    selectedHits = injected.selectedHits;
   };
 
   const emitTrace = (status                       )       => {
-    if (!config.trace.enabled) return;
     const totalMs = Math.round(performance.now() - startedAt);
     const injected = prependContext ?? "";
+    try {
+      dependencies.onComplete?.({
+        schemaVersion: LOCAL_RETRIEVER_API_VERSION,
+        status,
+        decision: demand.decision,
+        reason: demand.reason,
+        depth,
+        routeDecision,
+        rankedHits: fused.map(asLocalEvidence),
+        selectedHits: selectedHits.map(asLocalEvidence),
+        ...(prependContext ? { context: prependContext } : {}),
+        diagnostics: {
+          totalMs,
+          ...metrics,
+          vectorHits,
+          graphHits,
+          profileHits,
+          deterministicQueries,
+          llmCalls,
+          candidateMinScore,
+          ...(fallbackReason ? { fallbackReason } : {}),
+        },
+      });
+    } catch (error) {
+      api.logger?.warn?.(`active-recall adapter capture failed: ${String(error)}`);
+    }
+    if (!config.trace.enabled) return;
     queueTrace(api, {
       ts: new Date().toISOString(), session, profile: config.profile, status,
       elapsedMs: totalMs, totalMs,
@@ -257,10 +501,19 @@ async function runRecall(
       vectorMs: metrics.vectorMs, graphMs: metrics.graphMs, profileMs: metrics.profileMs,
       queryChars: rawPrompt.length, cleanedChars: cleaned.length,
       trigger: demand.reason                       , recallDepth: depth,
-      routeDecision, fallbackReason, graphTimedOut, vectorHits, graphHits, profileHits,
+      routeDecision,
+      projectScopeEnabled: config.projectScope.enabled,
+      projectId: projectIdentity.projectId,
+      projectNamespace: projectIdentity.namespace,
+      projectIdentitySource: projectIdentity.identitySource,
+      fallbackReason, graphTimedOut, vectorHits, graphHits, profileHits,
       gateDecision: demand.decision, gateStatus, gateReason,
       gateFinishReason, gateContentType, gateHasReasoningContent,
+      probeTopScore, probePassed, deterministicQueries, llmCalls,
+      balancedLlmInvariant: depth !== "balanced" || llmCalls === 0,
+      rescueStatus, rescueRemainingMs,
       expansion: expansionStatus, searches: traceSearches,
+      coldRetry,
       expansionParseMode: expansionDiagnostics?.parseMode,
       expansionFinishReason: expansionDiagnostics?.finishReason,
       expansionContentChars: expansionDiagnostics?.contentChars,
@@ -273,8 +526,10 @@ async function runRecall(
       qualityHighRawScore: config.qualityGate.highRawScore,
       qualityMediumRawScore: config.qualityGate.mediumRawScore,
       qualityMinRouteHits: config.qualityGate.minRouteHits,
-      fusionTop: fused.map(({ path, bestRawScore, rrfScore, routeHits, sourceWeight, finalRankScore, finalScore, source, routes, occurrences }) => ({
-        path, bestRawScore, rrfScore, routeHits, sourceWeight, finalRankScore, finalScore, source, routes, occurrences,
+      candidateMinScore,
+      qualityCandidates,
+      fusionTop: fused.map(({ path, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, source, routes, occurrences }) => ({
+        path, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, source, routes, occurrences,
       })),
       injectedChars: injected.length, injectedTokens: Math.ceil(injected.length / 4),
       injectedProfileChars: injectionLayers.profile,
@@ -290,38 +545,58 @@ async function runRecall(
     return undefined;
   }
 
-  if (demand.decision === "uncertain") {
-    const gateStartedAt = performance.now();
-    let gateAttempt                                                    ;
+  if (config.projectScope.enabled) {
     try {
-      gateAttempt = await dependencies.semanticGate(cleaned, config.expansion, {
-        ...config.semanticGate,
-        timeoutMs: boundedTimeout(config.semanticGate.timeoutMs, remainingMs(startedAt, config.maxTotalMs)),
-      });
-    } catch {
-      gateAttempt = { result: null, status: "request_fail", parseMode: "none" };
+      projectIdentity = await dependencies.resolveProject(ctx.cwd ?? ctx.workspaceDir, config.projectScope.gitTimeoutMs);
+    } catch (error) {
+      projectIdentity = { scope: "global", reason: `resolver_error:${error instanceof Error ? error.name : "unknown"}` };
+      fallbackReason = `project:${error instanceof Error ? error.message : String(error)}`;
     }
-    metrics.gateMs = Math.round(performance.now() - gateStartedAt);
-    gateStatus = gateAttempt.status;
-    gateReason = gateAttempt.result?.reason ?? demand.reason;
-    gateFinishReason = gateAttempt.finishReason;
-    gateContentType = gateAttempt.contentType;
-    gateHasReasoningContent = gateAttempt.hasReasoningContent;
-    if (!gateAttempt.result?.recall) {
-      depth = "none";
-      routeDecision = "none";
-      emitTrace("skipped_semantic_no");
-      return undefined;
-    }
-    depth = gateAttempt.result.depth;
+  } else {
+    projectIdentity = { scope: "global", reason: "project_scope_disabled" };
   }
 
-  const searchQuery = demand.query;
+  // Route selection has already consumed the original temporal cues. Only retrieval normalization may remove them.
+  const searchQuery = normalizeRecallQuery(demand.query);
+
+  if (demand.decision === "uncertain") {
+    const gateStartedAt = performance.now();
+    try {
+      const probe = scopeResult(await coldRetrySearch(dependencies, searchQuery, {
+        agent,
+        maxResults: scopedMaxResults(1, config),
+        minScore: candidateMinScore,
+        timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
+      }, () => remainingMs(startedAt, config.maxTotalMs), coldRetry));
+      probeLiteral = probe;
+      vectorHits += probe.hits.length;
+      probeTopScore = probe.hits[0]?.score;
+      probePassed = fuseForRecall([{ route: "probe", weight: config.rrf.originalWeight, result: probe }], config, searchQuery).length > 0;
+      gateStatus = probePassed ? "bge_probe_pass" : "bge_probe_fail";
+      gateReason = probePassed ? "bge_probe_quality_pass" : "bge_probe_quality_fail";
+      traceSearches.push({ route: "probe", query: searchQuery, hits: probe.hits.length, ...probe.timing });
+    } catch (error) {
+      gateStatus = "bge_probe_error";
+      gateReason = "bge_probe_error";
+      fallbackReason = `probe:${error instanceof Error ? error.message : String(error)}`;
+      probePassed = false;
+    }
+    metrics.gateMs = Math.round(performance.now() - gateStartedAt);
+    metrics.literalMs = metrics.gateMs;
+    metrics.searchMs += metrics.gateMs;
+    if (!probePassed) {
+      depth = "none";
+      routeDecision = "none";
+      emitTrace("skipped_probe_no");
+      return undefined;
+    }
+  }
+
   const auxiliaryRoutes                = [];
   if (config.graphMemory.enabled) {
     const profileStartedAt = performance.now();
     try {
-      const profile = await withTimeout(dependencies.profileSearch(searchQuery, config, ctx), config.graphMemory.readTimeoutMs, "profile memory read");
+      const profile = scopeResult(await withTimeout(dependencies.profileSearch(searchQuery, config, ctx), config.graphMemory.readTimeoutMs, "profile memory read"));
       profileHits = profile.hits.length;
       traceSearches.push({ route: "profile", query: searchQuery, hits: profile.hits.length, ...profile.timing });
       if (profile.hits.length > 0) auxiliaryRoutes.push({ route: "profile", weight: 1.8, result: profile });
@@ -335,9 +610,9 @@ async function runRecall(
   if (routeDecision === "graph" || routeDecision === "hybrid") {
     const graphStartedAt = performance.now();
     try {
-      const graph = await withTimeout(dependencies.graphSearch(searchQuery, config, ctx), config.graphMemory.readTimeoutMs, "graph memory read");
+      const graph = scopeResult(await withTimeout(dependencies.graphSearch(demand.query, config, ctx), config.graphMemory.readTimeoutMs, "graph memory read"));
       graphHits = graph.hits.length;
-      traceSearches.push({ route: "graph", query: searchQuery, hits: graph.hits.length, ...graph.timing });
+      traceSearches.push({ route: "graph", query: demand.query, hits: graph.hits.length, ...graph.timing });
       if (graph.hits.length > 0) auxiliaryRoutes.push({ route: "graph", weight: 1.6, result: graph });
     } catch (error) {
       graphFailed = true;
@@ -349,7 +624,7 @@ async function runRecall(
 
   if (routeDecision === "graph" && !graphFailed) {
     const fusionStartedAt = performance.now();
-    fused = fuseForRecall(auxiliaryRoutes, config);
+    fused = fuseForRecall(auxiliaryRoutes, config, searchQuery);
     metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
     inject();
     emitTrace(fused.length > 0 ? "ok" : emptyFusionStatus(auxiliaryRoutes));
@@ -360,22 +635,27 @@ async function runRecall(
   let status               = graphFailed || (demand.route === "hybrid" && graphHits === 0) ? "partial" : "fail_open";
   try {
     const vectorStartedAt = performance.now();
-    const literalStartedAt = performance.now();
-    const literal = await dependencies.search(searchQuery, {
-      agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore,
-      timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
-    });
-    metrics.literalMs = Math.round(performance.now() - literalStartedAt);
-    metrics.searchMs += metrics.literalMs;
-    vectorHits += literal.hits.length;
-    traceSearches.push({ route: "literal", query: searchQuery, hits: literal.hits.length, ...literal.timing });
+    let literal = probeLiteral;
+    if (!literal) {
+      const literalStartedAt = performance.now();
+      literal = scopeResult(await coldRetrySearch(dependencies, searchQuery, {
+        agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: candidateMinScore,
+        timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
+      }, () => remainingMs(startedAt, config.maxTotalMs), coldRetry));
+      metrics.literalMs = Math.round(performance.now() - literalStartedAt);
+      metrics.searchMs += metrics.literalMs;
+      vectorHits += literal.hits.length;
+      traceSearches.push({ route: "literal", query: searchQuery, hits: literal.hits.length, ...literal.timing });
+    }
     const literalRoute              = { route: "literal", weight: config.rrf.originalWeight, result: literal };
     const strong = isStrongSignal(literal.hits, config.strongSignal);
 
-    const fuseLiteral = (partial         )       => {
-      const routes = [literalRoute, ...auxiliaryRoutes];
+    const fuseAndInject = (routes               , partial         )       => {
       const fusionStartedAt = performance.now();
-      fused = fuseForRecall(routes, config);
+      // Keep bounded score diagnostics before filtering, without source content.
+      qualityCandidates = routes.slice(0, 8).flatMap(({ route, result }) =>
+        result.hits.slice(0, 3).map(({ score, vectorScore, textScore }) => ({ route, score, vectorScore, textScore })));
+      fused = fuseForRecall(routes, config, searchQuery);
       metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
       inject();
       status = fused.length > 0 ? (partial || graphFailed ? "partial" : "ok") : emptyFusionStatus(routes);
@@ -383,61 +663,95 @@ async function runRecall(
 
     if (strong || depth === "literal") {
       expansionStatus = strong ? "skipped_strong" : config.profile === "speed" ? "skipped_speed" : "skipped_literal";
-      fuseLiteral(false);
+      rescueStatus = "skipped_quality";
+      fuseAndInject([literalRoute, ...auxiliaryRoutes], false);
     } else {
-      const expansionStartedAt = performance.now();
-      let expansion                                         ;
-      try {
-        expansion = await dependencies.expand(searchQuery, {
-          ...config.expansion,
-          timeoutMs: boundedTimeout(config.expansion.timeoutMs, remainingMs(startedAt, config.maxTotalMs)),
-        }, maxAssociationsForDepth(config, depth));
-      } catch {
-        expansion = {
-          result: null,
-          status: "request_fail",
-          diagnostics: { parseMode: "none", contentChars: 0, failureReason: "request_fail" },
-        };
-      }
-      metrics.expansionMs = Math.round(performance.now() - expansionStartedAt);
-      expansionStatus = expansion.status;
-      expansionDiagnostics = expansion.diagnostics;
-      if (!expansion.result) {
-        fuseLiteral(true);
+      const deterministic = buildDeterministicSearchRoutes(
+        demand.query,
+        depth,
+        maxAssociationsForDepth(config, depth),
+      );
+      deterministicQueries = deterministic.length;
+      const deterministicSearchStartedAt = performance.now();
+      const routeBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
+      const settled = await Promise.allSettled(deterministic.map(async (route)                       => {
+        const result = scopeResult(await dependencies.search(route.query, {
+          agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: candidateMinScore, timeoutMs: routeBudget,
+        }));
+        vectorHits += result.hits.length;
+        traceSearches.push({ route: route.route, query: route.query, hits: result.hits.length, ...result.timing });
+        return { route: route.route, weight: route.weight, result };
+      }));
+      metrics.searchMs += Math.round(performance.now() - deterministicSearchStartedAt);
+      let successful = [literalRoute, ...successfulRoutes(settled), ...auxiliaryRoutes];
+      fuseAndInject(successful, settled.some((item) => item.status === "rejected"));
+      status = fused.length > 0
+        ? statusForFailures(deterministic.length + 1 + auxiliaryRoutes.length, successful.length, true, remainingMs(startedAt, config.maxTotalMs) === 0)
+        : emptyFusionStatus(successful);
+      if (graphFailed && fused.length > 0) status = "partial";
+
+      if (fused.length > 0) {
+        rescueStatus = "skipped_quality";
+      } else if (depth !== "deep") {
+        rescueStatus = "skipped_not_deep";
+      } else if (demand.reason !== "explicit_prefix" && demand.reason !== "memory_intent") {
+        rescueStatus = "skipped_intent";
       } else {
-        const routes = buildExpansionSearchRoutes(searchQuery, expansion.result);
-        if (routes.length === 0) {
-          fuseLiteral(true);
+        rescueRemainingMs = remainingMs(startedAt, config.maxTotalMs);
+        const requiredRescueBudget = Math.max(config.expansion.minRemainingBudgetMs, config.expansion.timeoutMs);
+        if (rescueRemainingMs < requiredRescueBudget) {
+          rescueStatus = "skipped_budget";
         } else {
-          const expandedSearchStartedAt = performance.now();
-          const routeBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
-          const settled = await Promise.allSettled(routes.map(async (route)                       => {
-            const result = await dependencies.search(route.query, {
-              agent, maxResults: maxResultsForDepth(depth), minScore: config.minScore, timeoutMs: routeBudget,
-            });
-            vectorHits += result.hits.length;
-            traceSearches.push({ route: route.route, query: route.query, hits: result.hits.length, ...result.timing });
-            return { route: route.route, weight: route.weight, result };
-          }));
-          metrics.searchMs += Math.round(performance.now() - expandedSearchStartedAt);
-          const successful = [literalRoute, ...successfulRoutes(settled), ...auxiliaryRoutes];
-          const fusionStartedAt = performance.now();
-          fused = fuseForRecall(successful, config);
-          metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
-          inject();
-          status = fused.length > 0
-            ? statusForFailures(routes.length + 1 + auxiliaryRoutes.length, successful.length, true, remainingMs(startedAt, config.maxTotalMs) === 0)
-            : emptyFusionStatus(successful);
-          if (graphFailed && fused.length > 0) status = "partial";
+          const expansionStartedAt = performance.now();
+          let expansion                                         ;
+          llmCalls += 1;
+          try {
+            expansion = await dependencies.expand(searchQuery, {
+              ...config.expansion,
+              timeoutMs: Math.min(2500, boundedTimeout(config.expansion.timeoutMs, rescueRemainingMs)),
+            }, maxAssociationsForDepth(config, depth));
+          } catch {
+            expansion = {
+              result: null,
+              status: "request_fail",
+              diagnostics: { parseMode: "none", contentChars: 0, failureReason: "request_fail" },
+            };
+          }
+          metrics.expansionMs = Math.round(performance.now() - expansionStartedAt);
+          expansionStatus = expansion.status;
+          expansionDiagnostics = expansion.diagnostics;
+          rescueStatus = expansion.status;
+          if (expansion.result) {
+            const seenQueries = new Set([queryKey(searchQuery), ...deterministic.map((route) => queryKey(route.query))]);
+            const rescueRoutes = buildExpansionSearchRoutes(searchQuery, expansion.result)
+              .filter((route) => !seenQueries.has(queryKey(route.query)));
+            const rescueSearchStartedAt = performance.now();
+            const rescueBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
+            const rescueSettled = await Promise.allSettled(rescueRoutes.map(async (route)                       => {
+              const result = scopeResult(await dependencies.search(route.query, {
+                agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: candidateMinScore, timeoutMs: rescueBudget,
+              }));
+              vectorHits += result.hits.length;
+              traceSearches.push({ route: `rescue:${route.route}`, query: route.query, hits: result.hits.length, ...result.timing });
+              return { route: `rescue:${route.route}`, weight: route.weight, result };
+            }));
+            metrics.searchMs += Math.round(performance.now() - rescueSearchStartedAt);
+            successful = [...successful, ...successfulRoutes(rescueSettled)];
+            fuseAndInject(successful, rescueSettled.some((item) => item.status === "rejected"));
+            status = fused.length > 0
+              ? statusForFailures(deterministic.length + rescueRoutes.length + 1 + auxiliaryRoutes.length, successful.length, true, remainingMs(startedAt, config.maxTotalMs) === 0)
+              : emptyFusionStatus(successful);
+            if (graphFailed && fused.length > 0) status = "partial";
+          }
         }
       }
     }
-    metrics.vectorMs = Math.round(performance.now() - vectorStartedAt);
+    metrics.vectorMs = Math.round(performance.now() - vectorStartedAt) + (probeLiteral ? metrics.gateMs : 0);
   } catch (error) {
     api.logger?.error?.(`active-recall vector fail-open: ${error instanceof Error ? error.message : String(error)}`);
     if (auxiliaryRoutes.length > 0) {
       const fusionStartedAt = performance.now();
-      fused = fuseForRecall(auxiliaryRoutes, config);
+      fused = fuseForRecall(auxiliaryRoutes, config, searchQuery);
       metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
       inject();
       status = fused.length > 0 ? "partial" : emptyFusionStatus(auxiliaryRoutes);
@@ -450,20 +764,79 @@ async function runRecall(
   return prependContext ? { prependContext } : undefined;
 }
 
+export async function retrieveLocal(
+  api           ,
+  event         ,
+  ctx           ,
+  config              ,
+  dependencyOverrides                              = {},
+)                             {
+  let result                               ;
+  const callerCapture = dependencyOverrides.onComplete;
+  await runRecall(api, event, ctx, config, {
+    ...dependencyOverrides,
+    onComplete: (captured) => {
+      result = captured;
+      callerCapture?.(captured);
+    },
+  });
+  return result ?? emptyLocalResult("capture_missing", {
+    literalMs: 0,
+    gateMs: 0,
+    expansionMs: 0,
+    searchMs: 0,
+    fusionMs: 0,
+    vectorMs: 0,
+    graphMs: 0,
+    profileMs: 0,
+  });
+}
+
+function createLocalRetrieverProvider(api           , config              )                         {
+  return {
+    apiVersion: LOCAL_RETRIEVER_API_VERSION,
+    providerId: "active-recall",
+    plan: (request) => planLocalRecall({ prompt: request.prompt }, request.context, config),
+    retrieve: async (request) => {
+      const requestedBudget = typeof request.maxTotalMs === "number" && Number.isFinite(request.maxTotalMs)
+        ? Math.max(1, Math.round(request.maxTotalMs))
+        : config.maxTotalMs;
+      const boundedConfig = requestedBudget < config.maxTotalMs
+        ? { ...config, maxTotalMs: requestedBudget, searchTimeoutMs: Math.min(config.searchTimeoutMs, requestedBudget) }
+        : config;
+      return retrieveLocal(api, { prompt: request.prompt }, request.context, boundedConfig);
+    },
+  };
+}
+
 const plugin = {
   register(api           )       {
     const config = readConfig(api.pluginConfig);
     if (!config.enabled) return;
-    api.on("before_prompt_build", (event, ctx) => runRecall(api, event, ctx             , config), { priority: 10 });
-    if (config.graphMemory.enabled && config.graphMemory.writer.enabled) {
+    if (config.retrievalMode === "standalone") {
+      api.on("before_prompt_build", (event, ctx) => runRecall(api, event, ctx             , config), { priority: 10 });
+    } else if (api.registerService) {
+      const provider = createLocalRetrieverProvider(api, config);
+      api.registerService({
+        id: "active-recall-local-retriever-v1",
+        start: () => {
+          if (!publishLocalRetriever(provider)) api.logger?.warn?.("active-recall adapter bridge already has a provider");
+        },
+        stop: () => { unpublishLocalRetriever(provider); },
+      });
+    } else {
+      api.logger?.warn?.("active-recall adapter mode requires OpenClaw registerService support");
+    }
+    if (effectiveWriterMode(config) !== "off") {
       api.on("agent_end", (event, ctx) => {
         enqueueMemoryWrite(api, event, ctx, config);
       }, { timeoutMs: 1000 });
     }
+    scheduleMemoryWarmup(api, config);
   },
 };
 
-export { injectContext, isInternalSession, runRecall, statusForFailures };
+export { injectContext, isInternalSession, isVerificationSession, runRecall, statusForFailures };
 export default plugin;
 
 

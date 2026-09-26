@@ -1,4 +1,17 @@
 
+import { supportingExcerpt } from "./snippet-quality.js";
+import { isVerificationSession } from "./session-guard.js";
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -87,11 +100,12 @@ export function isStrongSignal(
 }
 
 export function passesQualityGate(
-  hit                                              ,
-  gate                                                                        ,
+  hit                                                                  ,
+  gate                                                                                                       ,
 )          {
-  return hit.bestRawScore >= gate.highRawScore
-    || (hit.bestRawScore >= gate.mediumRawScore && hit.routeHits >= gate.minRouteHits);
+  const score = gate.metric === "vector" ? hit.bestVectorScore : hit.bestRawScore;
+  return score >= gate.highRawScore
+    || (score >= gate.mediumRawScore && hit.routeHits >= gate.minRouteHits);
 }
 
 export function successfulRoutes(settled                                     )                {
@@ -101,7 +115,18 @@ export function successfulRoutes(settled                                     )  
 export function fuseRoutes(routes               , settings                )             {
   const byPath = new Map                  ();
   for (const route of routes) {
-    distinctPathHits(route.result.hits, settings.minRawScore ?? Number.NEGATIVE_INFINITY)
+    // Select a usable chunk BEFORE collapsing a file. Never lend a metadata chunk's
+    // score or locator to a different body excerpt.
+    const eligible = route.result.hits.flatMap((hit) => {
+      const session = hit.snippet.match(/^\s*-\s*Session:\s*(.+)$/m)?.[1];
+      if (session && isVerificationSession(session.trim())) return [];
+      // Consolidation candidates are unconfirmed derived material, not primary evidence.
+      if (/^\s*(?:-\s*)?Candidate\s*:/im.test(hit.snippet)) return [];
+      const excerpt = supportingExcerpt(hit.snippet, settings.snippetChars, settings.query);
+      if (!excerpt) return [];
+      return [{ ...hit, snippet: excerpt.text, line: hit.line === undefined ? undefined : hit.line + excerpt.skippedLines }];
+    });
+    distinctPathHits(eligible, settings.minRawScore ?? Number.NEGATIVE_INFINITY)
       .forEach(({ hit, occurrences }, index) => {
         const key = canonicalPath(hit.path);
         const current = byPath.get(key);
@@ -117,20 +142,28 @@ export function fuseRoutes(routes               , settings                )     
           current.occurrences += occurrences;
           if (hit.score > current.bestRawScore) {
             current.bestRawScore = hit.score;
+            current.bestVectorScore = hit.vectorScore ?? 0;
             current.snippet = hit.snippet;
             current.line = hit.line;
             current.source = hit.source;
             current.sourceWeight = settings.preferSources[hit.source] ?? 1;
+            current.projectScope = hit.projectScope;
+            current.projectWeight = hit.projectWeight ?? 1;
             current.path = hit.path;
+            current.observedAt = hit.observedAt;
           }
           return;
         }
         byPath.set(key, {
           path: hit.path,
           bestRawScore: hit.score,
+          bestVectorScore: hit.vectorScore ?? 0,
+          ...(hit.observedAt === undefined ? {} : { observedAt: hit.observedAt }),
           rrfScore: baseContribution,
           routeHits: 1,
           sourceWeight: settings.preferSources[hit.source] ?? 1,
+          projectScope: hit.projectScope,
+          projectWeight: hit.projectWeight ?? 1,
           finalRankScore: contribution,
           finalScore: contribution,
           snippet: hit.snippet,
@@ -142,12 +175,13 @@ export function fuseRoutes(routes               , settings                )     
       });
   }
   return [...byPath.values()]
-    .map((hit) => ({
-      ...hit,
-      snippet: hit.snippet.slice(0, settings.snippetChars),
-      finalRankScore: hit.finalScore * hit.sourceWeight,
-      finalScore: hit.finalScore * hit.sourceWeight,
-    }))
+    .map((hit) => {
+      return {
+        ...hit,
+        finalRankScore: hit.finalScore * hit.sourceWeight * hit.projectWeight,
+        finalScore: hit.finalScore * hit.sourceWeight * hit.projectWeight,
+      };
+    })
     .filter((hit) => !settings.qualityGate || passesQualityGate(hit, settings.qualityGate))
     .sort((a, b) => b.finalRankScore - a.finalRankScore || b.bestRawScore - a.bestRawScore || a.path.localeCompare(b.path))
     .slice(0, settings.topK);

@@ -2,7 +2,7 @@ export type RecallProfile = "speed" | "balanced" | "deep";
 export type RecallDepth = "none" | "literal" | "balanced" | "deep";
 export type RecallTriggerMode = "always" | "on-demand" | "explicit";
 export type StructuredOutputMode = "json_object" | "json_schema";
-export type ThinkingMode = "auto" | "enabled" | "disabled" | "omit";
+export type ThinkingMode = "auto" | "enabled" | "disabled" | "omit" | "low" | "high" | "max";
 export type GraphMemoryProvider = "local-sqlite" | "graphiti" | "falkordb" | "neo4j";
 export type GraphRouteMode = "auto" | "vector" | "graph" | "hybrid";
 export type GraphWriterMode = "off" | "dry-run" | "shadow" | "write";
@@ -74,6 +74,10 @@ export interface GraphMemoryConfig {
     maxInputChars: number;
     traceFile: string;
     sessionAllowlist: string[];
+    /** Verification/acceptance sessions recall normally but never persist (read/write split). */
+    isolateVerificationSessions: boolean;
+    /** Extra session-key regexes excluded from persistence, for project-specific naming. */
+    excludeSessionPatterns: string[];
     maxEntitiesPerTurn: number;
     maxEdgesPerTurn: number;
     maxEpisodesPerTurn: number;
@@ -108,11 +112,15 @@ export interface RecallConfig {
     highRawScore: number;
     mediumRawScore: number;
     minRouteHits: number;
+    /** "blended" gates on memory-core's weighted hybrid score; "vector" on cosine similarity. */
+    metric: "blended" | "vector";
   };
   rrf: { k: number; originalWeight: number; rawScoreBlend: number };
   topK: number;
   snippetChars: number;
   minScore: number;
+  /** Broad memory-core candidate floor used before a vector-metric quality gate. */
+  candidateMinScore: number;
   preferSources: Record<string, number>;
   trace: { enabled: boolean; file: string };
   disableActiveMemoryHint: boolean;
@@ -157,7 +165,7 @@ function structuredOutputModeValue(value: unknown): StructuredOutputMode {
 }
 
 function thinkingModeValue(value: unknown): ThinkingMode {
-  return value === "enabled" || value === "disabled" || value === "omit" ? value : "auto";
+  return value === "enabled" || value === "disabled" || value === "omit" || value === "low" || value === "high" || value === "max" ? value : "auto";
 }
 
 function graphProviderValue(value: unknown): GraphMemoryProvider {
@@ -297,6 +305,8 @@ export function readConfig(pluginConfig: unknown): RecallConfig {
         maxInputChars: numberValue(graphWriter.maxInputChars, 12000),
         traceFile: stringValue(graphWriter.traceFile, "memory/graph-memory/write-traces.jsonl"),
         sessionAllowlist: stringArray(graphWriter.sessionAllowlist, []),
+        isolateVerificationSessions: graphWriter.isolateVerificationSessions !== false,
+        excludeSessionPatterns: stringArray(graphWriter.excludeSessionPatterns, []),
         maxEntitiesPerTurn: Math.max(1, Math.round(numberValue(graphWriter.maxEntitiesPerTurn, 12))),
         maxEdgesPerTurn: Math.max(0, Math.round(numberValue(graphWriter.maxEdgesPerTurn, 16))),
         maxEpisodesPerTurn: Math.max(0, Math.min(1, Math.round(numberValue(graphWriter.maxEpisodesPerTurn, 1)))),
@@ -337,6 +347,7 @@ export function readConfig(pluginConfig: unknown): RecallConfig {
         highRawScore,
         mediumRawScore: numberValue(qualityGate.mediumRawScore, numberValue(raw.minScore, 0.55)),
         minRouteHits: Math.max(1, Math.round(numberValue(qualityGate.minRouteHits, 2))),
+        metric: qualityGate.metric === "vector" ? "vector" as const : "blended" as const,
       };
     })(),
     rrf: {
@@ -347,6 +358,7 @@ export function readConfig(pluginConfig: unknown): RecallConfig {
     topK: numberValue(raw.topK, 3),
     snippetChars: numberValue(raw.snippetChars, 200),
     minScore: numberValue(raw.minScore, 0.55),
+    candidateMinScore: numberValue(raw.candidateMinScore, 0.1),
     preferSources: numberMap(raw.preferSources, { memory: 1, wiki: 1, sessions: 1 }),
     trace: {
       enabled: booleanValue(trace.enabled, true),

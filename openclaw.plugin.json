@@ -105,7 +105,8 @@
           "minBestRawScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.65, "description": "Deprecated alias for highRawScore" },
           "highRawScore": { "type": "number", "minimum": 0, "maximum": 1, "description": "Defaults to minBestRawScore (0.65)" },
           "mediumRawScore": { "type": "number", "minimum": 0, "maximum": 1, "description": "Defaults to minScore (0.55)" },
-          "minRouteHits": { "type": "integer", "minimum": 1, "maximum": 10, "default": 2 }
+          "minRouteHits": { "type": "integer", "minimum": 1, "maximum": 10, "default": 2 },
+          "metric": { "type": "string", "enum": ["blended", "vector"], "default": "blended", "description": "Gate on memory-core's blended hybrid score or on vector similarity; vector ignores keyword-only hits with no embedding match" }
         }
       },
       "rrf": {
@@ -119,6 +120,7 @@
       "topK": { "type": "number", "minimum": 1, "maximum": 20, "default": 3 },
       "snippetChars": { "type": "number", "minimum": 50, "maximum": 2000, "default": 200 },
       "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.55 },
+      "candidateMinScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1, "description": "Broad memory-core candidate floor used before a vector-metric quality gate; the final vector gate still decides injection" },
       "preferSources": {
         "type": "object",
         "properties": {
@@ -163,6 +165,8 @@
               "maxInputChars": { "type": "integer", "minimum": 1000, "maximum": 50000, "default": 12000 },
               "traceFile": { "type": "string", "default": "memory/graph-memory/write-traces.jsonl" },
               "sessionAllowlist": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [], "description": "Exact session keys or prefix patterns ending in *. Empty means all eligible non-internal sessions." },
+              "isolateVerificationSessions": { "type": "boolean", "default": true, "description": "Verification/acceptance sessions still recall normally but never persist memory, so a check cannot retrieve its own written answer. Reads are never gated by session name." },
+              "excludeSessionPatterns": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [], "description": "Extra session-key regexes excluded from persistence, for project-specific naming." },
               "maxEntitiesPerTurn": { "type": "integer", "minimum": 1, "maximum": 100, "default": 12 },
               "maxEdgesPerTurn": { "type": "integer", "minimum": 0, "maximum": 200, "default": 16 },
               "maxEpisodesPerTurn": { "type": "integer", "minimum": 0, "maximum": 1, "default": 1 },

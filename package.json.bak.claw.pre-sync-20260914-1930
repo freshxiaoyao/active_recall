@@ -1,0 +1,20 @@
+{
+  "name": "@openclaw/active-recall",
+  "version": "0.6.1",
+  "private": true,
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "generate": "node scripts/prepare-tests.mjs",
+    "pretest": "node scripts/prepare-tests.mjs",
+    "test": "node --test tests/active-recall.test.ts tests/graph-memory.test.ts tests/graph-admin.test.ts tests/writer-replay.test.ts tests/recall-baseline.test.ts",
+    "pregraph:admin": "node scripts/prepare-tests.mjs",
+    "graph:admin": "node scripts/graph-admin.mjs",
+    "prereplay:writer": "node scripts/prepare-tests.mjs",
+    "replay:writer": "node scripts/replay-writer.mjs",
+    "prebaseline:recall": "node scripts/prepare-tests.mjs",
+    "baseline:recall": "node scripts/recall-baseline.mjs"
+  }
+}

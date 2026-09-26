@@ -1,0 +1,194 @@
+{
+  "id": "active-recall",
+  "name": "Active Recall",
+  "description": "On-demand hybrid Profile, Vector, and Temporal Graph Memory with deterministic balanced retrieval, deep-only budgeted LLM rescue, RRF fusion, and a non-blocking agent_end writer. Graph Memory is optional and defaults off.",
+  "activation": {
+    "onCapabilities": ["hook"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean", "default": true },
+      "retrievalMode": {
+        "type": "string",
+        "enum": ["standalone", "adapter"],
+        "default": "standalone",
+        "description": "standalone keeps the existing prompt hook; adapter exposes one versioned in-process Local Retriever service for evidence-rag and omits that hook to prevent duplicate retrieval"
+      },
+      "agents": { "type": "array", "items": { "type": "string" }, "default": ["main"] },
+      "skipSystemEvents": { "type": "boolean", "default": true },
+      "trigger": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": { "type": "string", "enum": ["on-demand", "always", "explicit"], "default": "on-demand" },
+          "explicitPrefixes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": ["/recall", "/memory", "回忆：", "记忆："] },
+          "suppressPrefixes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": ["/no-recall", "/no-memory", "不查记忆："] },
+          "additionalKeywords": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [] }
+        }
+      },
+      "profile": { "type": "string", "enum": ["speed", "balanced", "deep"], "default": "balanced" },
+      "injectTokenBudget": { "type": "number", "minimum": 100, "maximum": 4000, "default": 800 },
+      "maxTotalMs": { "type": "number", "minimum": 500, "maximum": 60000, "default": 5000 },
+      "searchTimeoutMs": { "type": "number", "minimum": 100, "maximum": 30000, "default": 2200 },
+      "expansion": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": { "type": "string", "default": "https://api.deepseek.com/v1" },
+          "apiKeyEnv": { "type": "string", "default": "DEEPSEEK_API_KEY" },
+          "model": { "type": "string", "default": "deepseek-v4-flash" },
+          "headers": { "type": "object" },
+          "timeoutMs": { "type": "number", "minimum": 100, "maximum": 2500, "default": 2500, "description": "Hard AbortController timeout for deep-only LLM rescue" },
+          "minRemainingBudgetMs": { "type": "number", "minimum": 2500, "maximum": 60000, "default": 2750, "description": "Do not start LLM rescue unless at least this much total budget remains" },
+          "maxOutputTokens": { "type": "number", "minimum": 50, "maximum": 4000, "default": 800 },
+          "responseFormat": { "type": "string", "enum": ["json_object", "json_schema"], "default": "json_object" },
+          "thinkingMode": { "type": "string", "enum": ["auto", "enabled", "disabled", "omit", "low", "high", "max"], "default": "auto", "description": "auto disables thinking for the official DeepSeek endpoint and omits the field elsewhere" },
+          "associations": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "maxBalanced": { "type": "number", "default": 1 },
+              "maxDeep": { "type": "number", "default": 3 }
+            }
+          }
+        }
+      },
+      "semanticGate": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false, "description": "Deprecated compatibility switch; uncertain demand uses a BGE topK=1 quality probe" },
+          "model": { "type": "string", "description": "Defaults to expansion.model" },
+          "timeoutMs": { "type": "number", "minimum": 200, "maximum": 5000, "default": 1800 },
+          "maxOutputTokens": { "type": "number", "minimum": 50, "maximum": 500, "default": 160 }
+        }
+      },
+      "projectScope": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true, "description": "Resolve the current Git project and apply Active Recall-side namespace filtering without changing memory-core" },
+          "sameProjectBoost": { "type": "number", "minimum": 1, "maximum": 5, "default": 1.5 },
+          "includeGlobal": { "type": "boolean", "default": true },
+          "otherProjectPolicy": { "type": "string", "enum": ["exclude", "low-weight"], "default": "exclude" },
+          "otherProjectWeight": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.25 },
+          "candidateMultiplier": { "type": "number", "minimum": 1, "maximum": 5, "default": 3, "description": "Bounded over-fetch within each existing search so post-filtering cannot easily starve same-project candidates" },
+          "gitTimeoutMs": { "type": "integer", "minimum": 25, "maximum": 2000, "default": 250 }
+        }
+      },
+      "strongSignal": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "minScore": { "type": "number", "default": 0.85 },
+          "gap": { "type": "number", "default": 0.15 },
+          "enabled": { "type": "boolean", "default": true },
+          "sources": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "memory": { "$ref": "#/$defs/strongCalibration" },
+              "documents": { "$ref": "#/$defs/strongCalibration" },
+              "wiki": { "$ref": "#/$defs/strongCalibration" },
+              "sessions": { "$ref": "#/$defs/strongCalibration" },
+              "default": { "$ref": "#/$defs/strongCalibration" }
+            }
+          }
+        }
+      },
+      "qualityGate": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "minBestRawScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.65, "description": "Deprecated alias for highRawScore" },
+          "highRawScore": { "type": "number", "minimum": 0, "maximum": 1, "description": "Defaults to minBestRawScore (0.65)" },
+          "mediumRawScore": { "type": "number", "minimum": 0, "maximum": 1, "description": "Defaults to minScore (0.55)" },
+          "minRouteHits": { "type": "integer", "minimum": 1, "maximum": 10, "default": 2 }
+        }
+      },
+      "rrf": {
+        "type": "object",
+        "properties": {
+          "k": { "type": "number", "default": 20 },
+          "originalWeight": { "type": "number", "default": 2.0 },
+          "rawScoreBlend": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 }
+        }
+      },
+      "topK": { "type": "number", "minimum": 1, "maximum": 20, "default": 3 },
+      "snippetChars": { "type": "number", "minimum": 50, "maximum": 2000, "default": 200 },
+      "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.55 },
+      "preferSources": {
+        "type": "object",
+        "properties": {
+          "memory": { "type": "number", "default": 1.0 },
+          "wiki": { "type": "number", "default": 1.0 },
+          "sessions": { "type": "number", "default": 1.0 }
+        }
+      },
+      "trace": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "file": { "type": "string", "default": "memory/recall-traces.jsonl" }
+        }
+      },
+      "graphMemory": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "provider": { "type": "string", "enum": ["local-sqlite", "graphiti", "falkordb", "neo4j"], "default": "local-sqlite" },
+          "file": { "type": "string", "default": "memory/graph-memory/graph-memory-v1.sqlite" },
+          "profileFile": { "type": "string", "default": "memory/profile-memory.json" },
+          "vectorDir": { "type": "string", "default": "memory/graph-memory/episodes" },
+          "readTimeoutMs": { "type": "integer", "minimum": 10, "maximum": 5000, "default": 120 },
+          "writeTimeoutMs": { "type": "integer", "minimum": 500, "maximum": 60000, "default": 12000 },
+          "routeMode": { "type": "string", "enum": ["auto", "vector", "graph", "hybrid"], "default": "auto" },
+          "maxGraphResults": { "type": "integer", "minimum": 1, "maximum": 20, "default": 4 },
+          "maxHops": { "type": "integer", "minimum": 1, "maximum": 4, "default": 2 },
+          "profileBudget": { "type": "integer", "minimum": 0, "maximum": 2000, "default": 160 },
+          "vectorBudget": { "type": "integer", "minimum": 0, "maximum": 4000, "default": 600 },
+          "graphBudget": { "type": "integer", "minimum": 0, "maximum": 2000, "default": 300 },
+          "writer": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean", "default": true },
+              "mode": { "type": "string", "enum": ["off", "dry-run", "shadow", "write"], "default": "off", "description": "Writer rollout mode. dry-run and shadow extract/validate only and never mutate Graph, Profile, or Vector stores." },
+              "model": { "type": "string", "description": "Defaults to expansion.model" },
+              "timeoutMs": { "type": "integer", "minimum": 500, "maximum": 30000, "default": 8000 },
+              "maxOutputTokens": { "type": "integer", "minimum": 100, "maximum": 4000, "default": 1200 },
+              "maxInputChars": { "type": "integer", "minimum": 1000, "maximum": 50000, "default": 12000 },
+              "traceFile": { "type": "string", "default": "memory/graph-memory/write-traces.jsonl" },
+              "sessionAllowlist": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [], "description": "Exact session keys or prefix patterns ending in *. Empty means all eligible non-internal sessions." },
+              "maxEntitiesPerTurn": { "type": "integer", "minimum": 1, "maximum": 100, "default": 12 },
+              "maxEdgesPerTurn": { "type": "integer", "minimum": 0, "maximum": 200, "default": 16 },
+              "maxEpisodesPerTurn": { "type": "integer", "minimum": 0, "maximum": 1, "default": 1 },
+              "circuitBreaker": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "failureThreshold": { "type": "integer", "minimum": 1, "maximum": 20, "default": 3 },
+                  "resetAfterMs": { "type": "integer", "minimum": 1000, "maximum": 86400000, "default": 300000 }
+                }
+              }
+            }
+          }
+        }
+      },
+      "disableActiveMemoryHint": { "type": "boolean", "default": true }
+    },
+    "$defs": {
+      "strongCalibration": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "minScore": { "type": "number", "minimum": 0, "maximum": 1 },
+          "gap": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    }
+  }
+}

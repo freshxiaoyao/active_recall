@@ -95,6 +95,39 @@
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 const profileBudgets                                = {
   speed: 400,
   balanced: 800,
@@ -132,7 +165,7 @@ function structuredOutputModeValue(value         )                       {
 }
 
 function thinkingModeValue(value         )               {
-  return value === "enabled" || value === "disabled" || value === "omit" ? value : "auto";
+  return value === "enabled" || value === "disabled" || value === "omit" || value === "low" || value === "high" || value === "max" ? value : "auto";
 }
 
 function graphProviderValue(value         )                      {
@@ -141,6 +174,20 @@ function graphProviderValue(value         )                      {
 
 function graphRouteModeValue(value         )                 {
   return value === "vector" || value === "graph" || value === "hybrid" ? value : "auto";
+}
+
+function graphWriterModeValue(value         , fallback                 )                  {
+  return value === "off" || value === "dry-run" || value === "shadow" || value === "write"
+    ? value
+    : fallback;
+}
+
+function retrievalModeValue(value         )                {
+  return value === "adapter" ? "adapter" : "standalone";
+}
+
+function otherProjectPolicyValue(value         )                     {
+  return value === "low-weight" ? "low-weight" : "exclude";
 }
 
 function stringArray(value         , fallback          )           {
@@ -178,13 +225,16 @@ export function readConfig(pluginConfig         )               {
   const strongSources = record(strongSignal.sources);
   const qualityGate = record(raw.qualityGate);
   const semanticGate = record(raw.semanticGate);
+  const projectScope = record(raw.projectScope);
   const graphMemory = record(raw.graphMemory);
   const graphWriter = record(graphMemory.writer);
+  const graphWriterCircuitBreaker = record(graphWriter.circuitBreaker);
   const rrf = record(raw.rrf);
   const trace = record(raw.trace);
 
   return {
     enabled: booleanValue(raw.enabled, true),
+    retrievalMode: retrievalModeValue(raw.retrievalMode),
     agents: Array.isArray(raw.agents) && raw.agents.every((item) => typeof item === "string")
       ? raw.agents
       : ["main"],
@@ -204,7 +254,8 @@ export function readConfig(pluginConfig         )               {
       apiKeyEnv: stringValue(expansion.apiKeyEnv, "DEEPSEEK_API_KEY"),
       model: stringValue(expansion.model, "deepseek-v4-flash"),
       headers: stringMap(expansion.headers),
-      timeoutMs: numberValue(expansion.timeoutMs, 2500),
+      timeoutMs: Math.min(2500, numberValue(expansion.timeoutMs, 2500)),
+      minRemainingBudgetMs: numberValue(expansion.minRemainingBudgetMs, 2750),
       maxOutputTokens: numberValue(expansion.maxOutputTokens, 800),
       responseFormat: structuredOutputModeValue(expansion.responseFormat),
       thinkingMode: thinkingModeValue(expansion.thinkingMode),
@@ -214,10 +265,19 @@ export function readConfig(pluginConfig         )               {
       },
     },
     semanticGate: {
-      enabled: booleanValue(semanticGate.enabled, true),
+      enabled: booleanValue(semanticGate.enabled, false),
       model: stringValue(semanticGate.model, stringValue(expansion.model, "deepseek-v4-flash")),
       timeoutMs: numberValue(semanticGate.timeoutMs, 1800),
       maxOutputTokens: numberValue(semanticGate.maxOutputTokens, 160),
+    },
+    projectScope: {
+      enabled: booleanValue(projectScope.enabled, true),
+      sameProjectBoost: numberValue(projectScope.sameProjectBoost, 1.5),
+      includeGlobal: booleanValue(projectScope.includeGlobal, true),
+      otherProjectPolicy: otherProjectPolicyValue(projectScope.otherProjectPolicy),
+      otherProjectWeight: numberValue(projectScope.otherProjectWeight, 0.25),
+      candidateMultiplier: Math.max(1, Math.min(5, numberValue(projectScope.candidateMultiplier, 3))),
+      gitTimeoutMs: Math.max(25, Math.min(2000, Math.round(numberValue(projectScope.gitTimeoutMs, 250)))),
     },
     graphMemory: {
       enabled: booleanValue(graphMemory.enabled, false),
@@ -235,11 +295,25 @@ export function readConfig(pluginConfig         )               {
       graphBudget: numberValue(graphMemory.graphBudget, 300),
       writer: {
         enabled: booleanValue(graphWriter.enabled, true),
+        mode: graphWriterModeValue(
+          graphWriter.mode,
+          booleanValue(graphWriter.enabled, true) && booleanValue(graphMemory.enabled, false) ? "write" : "off",
+        ),
         model: stringValue(graphWriter.model, stringValue(expansion.model, "deepseek-v4-flash")),
         timeoutMs: numberValue(graphWriter.timeoutMs, 8000),
         maxOutputTokens: numberValue(graphWriter.maxOutputTokens, 1200),
         maxInputChars: numberValue(graphWriter.maxInputChars, 12000),
         traceFile: stringValue(graphWriter.traceFile, "memory/graph-memory/write-traces.jsonl"),
+        sessionAllowlist: stringArray(graphWriter.sessionAllowlist, []),
+        isolateVerificationSessions: graphWriter.isolateVerificationSessions !== false,
+        excludeSessionPatterns: stringArray(graphWriter.excludeSessionPatterns, []),
+        maxEntitiesPerTurn: Math.max(1, Math.round(numberValue(graphWriter.maxEntitiesPerTurn, 12))),
+        maxEdgesPerTurn: Math.max(0, Math.round(numberValue(graphWriter.maxEdgesPerTurn, 16))),
+        maxEpisodesPerTurn: Math.max(0, Math.min(1, Math.round(numberValue(graphWriter.maxEpisodesPerTurn, 1)))),
+        circuitBreaker: {
+          failureThreshold: Math.max(1, Math.round(numberValue(graphWriterCircuitBreaker.failureThreshold, 3))),
+          resetAfterMs: Math.max(1000, Math.round(numberValue(graphWriterCircuitBreaker.resetAfterMs, 300000))),
+        },
       },
     },
     strongSignal: (() => {
@@ -273,6 +347,7 @@ export function readConfig(pluginConfig         )               {
         highRawScore,
         mediumRawScore: numberValue(qualityGate.mediumRawScore, numberValue(raw.minScore, 0.55)),
         minRouteHits: Math.max(1, Math.round(numberValue(qualityGate.minRouteHits, 2))),
+        metric: qualityGate.metric === "vector" ? "vector"          : "blended"         ,
       };
     })(),
     rrf: {
@@ -283,6 +358,7 @@ export function readConfig(pluginConfig         )               {
     topK: numberValue(raw.topK, 3),
     snippetChars: numberValue(raw.snippetChars, 200),
     minScore: numberValue(raw.minScore, 0.55),
+    candidateMinScore: numberValue(raw.candidateMinScore, 0.1),
     preferSources: numberMap(raw.preferSources, { memory: 1, wiki: 1, sessions: 1 }),
     trace: {
       enabled: booleanValue(trace.enabled, true),

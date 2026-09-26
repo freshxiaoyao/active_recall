@@ -7,7 +7,7 @@ import { createGraphProvider } from "./graph-provider.js";
 import { ENTITY_TYPES, isEntityType, isRelationType, RELATION_TYPES } from "./graph-types.js";
 import { ProfileMemoryStore } from "./profile-memory.js";
 import { resolveProjectIdentity } from "./project-scope.js";
-import { isInternalSession } from "./session-guard.js";
+import { isInternalSession, isVerificationSession } from "./session-guard.js";
 import { triggerMemorySync } from "./search.js";
 import { messageTextContent, parseJsonCandidates, structuredResponseFormat, thinkingRequestField } from "./structured-output.js";
 import type { GraphWriterMode, RecallConfig } from "./config.js";
@@ -32,7 +32,17 @@ export interface WriterContext {
 }
 
 interface WriterApi {
+  config?: unknown;
+  runtime?: { config?: { current?: () => unknown } };
   logger?: { error?: (message: string) => void; warn?: (message: string) => void };
+}
+
+export function resolveWriterRuntimeConfig(api: WriterApi): unknown {
+  try {
+    return api.runtime?.config?.current?.() ?? api.config;
+  } catch {
+    return api.config;
+  }
 }
 
 export interface SalientMemoryExtraction {
@@ -126,7 +136,15 @@ export function shouldSkipMemoryWrite(event: AgentEndEvent, ctx: WriterContext, 
   const agent = ctx.agentId?.trim() || "main";
   if (effectiveWriterMode(config) === "off") return "disabled";
   if (event.success !== true) return "run_failed";
+  // Gateway announcements can reuse a user's session and transcript. They are
+  // delivery runs, not new user turns, and must not trigger extraction again.
+  if ((event.runId ?? ctx.runId ?? "").startsWith("announce:")) return "internal_run";
   if (!session || isInternalSession(session)) return "internal_session";
+  // Read/write split: verification sessions may recall normally but must never persist, so an
+  // acceptance run cannot later retrieve its own written answer as evidence (round-2 audit).
+  if (config.graphMemory.writer.isolateVerificationSessions && isVerificationSession(session, config.graphMemory.writer.excludeSessionPatterns)) {
+    return "verification_session";
+  }
   if (!config.agents.includes(agent)) return "agent_not_allowed";
   if (!sessionAllowed(session, config.graphMemory.writer.sessionAllowlist)) return "session_not_allowed";
   if (!Array.isArray(event.messages) || !lastConversationTurn(event.messages)) return "missing_turn";
@@ -232,14 +250,20 @@ export async function extractSalientMemory(
     const payload = record(await response.json());
     const choice = Array.isArray(payload.choices) ? record(payload.choices[0]) : {};
     const message = record(choice.message);
-    const content = messageTextContent(message.content).text;
-    if (!content) throw new Error("memory writer returned empty content");
+    const contentInfo = messageTextContent(message.content);
+    const reasoningChars = messageTextContent(message.reasoning_content).text?.length ?? 0;
+    const finish = typeof choice.finish_reason === "string" ? choice.finish_reason : "unknown";
+    const content = contentInfo.text;
+    if (!content) {
+      // Self-diagnosing: distinguishes empty content from reasoning-only and truncated responses.
+      throw new Error(`memory writer returned empty content (contentType=${contentInfo.contentType}, reasoningChars=${reasoningChars}, finish=${finish})`);
+    }
     for (const candidate of parseJsonCandidates(content)) {
       const extraction = parseExtraction(candidate.value);
       if (extraction) return extraction;
       if (record(candidate.value).salient === false) return null;
     }
-    throw new Error("memory writer returned invalid structured output");
+    throw new Error(`memory writer returned invalid structured output (contentType=${contentInfo.contentType}, contentChars=${content.length}, finish=${finish})`);
   } finally {
     clearTimeout(timer);
   }
@@ -529,8 +553,12 @@ export async function runMemoryWrite(
       ensureWriterBudget(startedAt, config, "vector persistence");
       const vectorWrite = await writeVectorEpisode(episode, vectorPath.absolute);
       traceBase.vectorWrite = vectorWrite;
-      if (vectorWrite) void (overrides.sync ?? triggerMemorySync)(ctx.agentId ?? "main")
-        .catch((error) => api.logger?.warn?.(`active-recall vector sync failed: ${String(error)}`));
+      if (vectorWrite) {
+        const sync = overrides.sync
+          ? overrides.sync(ctx.agentId ?? "main")
+          : triggerMemorySync(ctx.agentId ?? "main", resolveWriterRuntimeConfig(api));
+        void sync.catch((error) => api.logger?.warn?.(`active-recall vector sync failed: ${String(error)}`));
+      }
       result = {
         status: "ok",
         episodeId,

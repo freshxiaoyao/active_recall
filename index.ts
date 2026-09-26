@@ -13,9 +13,11 @@ import {
   publishLocalRetriever,
   unpublishLocalRetriever,
 } from "./local-retriever.js";
-import { isInternalSession } from "./session-guard.js";
-import { memorySearch } from "./search.js";
+import { isInternalSession, isVerificationSession } from "./session-guard.js";
+import { memorySearch, setWarmupContext, warmMemorySearch } from "./search.js";
 import { writeTrace } from "./trace.js";
+import { excludeVerificationEpisodes } from "./derived-evidence.js";
+import { hydrateWikiExcerpts } from "./wiki-excerpts.js";
 import type { RecallConfig, RecallDepth } from "./config.js";
 import type { RecallTriggerReason } from "./demand.js";
 import type { ExpansionDiagnostics, ExpansionStatus } from "./expansion.js";
@@ -27,7 +29,9 @@ import type { ProjectIdentity } from "./project-scope.js";
 import type { TraceRecord } from "./trace.js";
 
 interface PluginApi {
+  config?: unknown;
   pluginConfig?: unknown;
+  runtime?: { config?: { current?: () => unknown } };
   workspaceDir?: string;
   logger?: { error?: (message: string) => void; warn?: (message: string) => void };
   on(event: "before_prompt_build", handler: (event: unknown, ctx: RecallCtx) => Promise<{ prependContext: string } | undefined>, options: { priority: number }): void;
@@ -126,6 +130,35 @@ function boundedTimeout(configuredMs: number, remaining: number): number {
   return Math.max(1, Math.min(configuredMs, Math.max(0, remaining)));
 }
 
+/**
+ * A cold in-process memory manager can miss the first deadline and answer the next call.
+ * Measured 2026-09-10: first search after idle timed out at 2200ms, the immediate retry
+ * returned in 1210ms — the whole turn used to fail open and inject nothing. Retry once on a
+ * timeout while the run still has budget; never retry other failures and never retry twice.
+ */
+const COLD_RETRY_MIN_MS = 1500;
+interface ColdRetryStats { attempts: number; retries: number; rescued: number }
+function coldRetrySearch(
+  dependencies: RecallDependencies,
+  query: string,
+  options: Parameters<RecallDependencies["search"]>[1],
+  remaining: () => number,
+  stats?: ColdRetryStats,
+): ReturnType<RecallDependencies["search"]> {
+  if (stats) stats.attempts += 1;
+  return dependencies.search(query, options).catch((error: unknown) => {
+    if (!(error instanceof Error) || !/timeout/i.test(error.message)) throw error;
+    const budget = remaining();
+    if (budget < COLD_RETRY_MIN_MS) throw error;
+    if (stats) stats.retries += 1;
+    return dependencies.search(query, { ...options, timeoutMs: boundedTimeout(budget, budget) })
+      .then((value) => {
+        if (stats) stats.rescued += 1;
+        return value;
+      });
+  });
+}
+
 function scopedMaxResults(base: number, config: RecallConfig): number {
   return config.projectScope.enabled
     ? Math.min(20, Math.max(base, Math.ceil(base * config.projectScope.candidateMultiplier)))
@@ -155,13 +188,25 @@ function emptyFusionStatus(routes: SearchRoute[]): "low_quality" | "no_result" {
   return routes.some((route) => route.result.hits.length > 0) ? "low_quality" : "no_result";
 }
 
-function fuseForRecall(routes: SearchRoute[], config: RecallConfig): ReturnType<typeof fuseRoutes> {
+function resolveCandidateMinScore(config: RecallConfig): number {
+  // memory-core filters on its blended hybrid score before returning vectorScore.
+  // Keep the legacy blended-score floor unless the final gate explicitly owns
+  // quality with the vector metric; then retrieve broadly and gate afterwards.
+  return config.qualityGate.metric === "vector"
+    ? Math.min(config.minScore, config.candidateMinScore)
+    : config.minScore;
+}
+
+function fuseForRecall(routes: SearchRoute[], config: RecallConfig, query?: string): ReturnType<typeof fuseRoutes> {
   return fuseRoutes(routes, {
+    query,
     k: config.rrf.k,
     preferSources: { profile: 1.2, graph: 1.1, ...config.preferSources },
     snippetChars: config.snippetChars,
     topK: config.topK,
-    minRawScore: config.qualityGate.mediumRawScore,
+    // A vector-metric gate must not pre-filter on the blended score: keyword-only hits
+    // carry blended ~0.29 but vector 0, and strong semantic hits can carry blended < 0.5.
+    minRawScore: config.qualityGate.metric === "vector" ? 0 : config.qualityGate.mediumRawScore,
     rawScoreBlend: config.rrf.rawScoreBlend,
     qualityGate: config.qualityGate,
   });
@@ -192,9 +237,42 @@ export interface RecallDependencies {
   onComplete?: (result: LocalRecallResult) => void;
 }
 
+function resolveRuntimeConfig(api: PluginApi): unknown {
+  try {
+    return api.runtime?.config?.current?.() ?? api.config;
+  } catch {
+    return api.config;
+  }
+}
+
+/** 预热只接受 Gateway 已解析的 runtime config；拿不到就跳过（宁可不预热，也不用未解析 SecretRef 建错 manager）。 */
+function resolveWarmupRuntimeConfig(api: PluginApi): unknown {
+  try {
+    return api.runtime?.config?.current?.();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Gateway 重启后的冷态 manager 预热：延迟执行，不阻塞插件注册与首轮提示构建。 */
+function scheduleMemoryWarmup(api: PluginApi, config: RecallConfig): void {
+  const agent = (Array.isArray(config.agents) ? config.agents.find((id) => typeof id === "string" && id.trim()) : undefined) ?? "main";
+  // 立即注册上下文，让探针超时触发的自愈预热也能工作
+  setWarmupContext({ agent, resolveRuntimeConfig: () => resolveWarmupRuntimeConfig(api) });
+  const timer = setTimeout(() => { warmMemorySearch("gateway-start"); }, 5000);
+  timer.unref?.();
+}
+
+export function createMemorySearchDependency(
+  api: PluginApi,
+  search: typeof memorySearch = memorySearch,
+): typeof memorySearch {
+  return (query, options) => search(query, { ...options, runtimeConfig: resolveRuntimeConfig(api) });
+}
+
 function asLocalEvidence(hit: ReturnType<typeof fuseRoutes>[number]): LocalRecallEvidence {
-  const { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, routes, occurrences } = hit;
-  return { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, routes, occurrences };
+  const { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, routes, occurrences, observedAt } = hit;
+  return { path, line, snippet, source, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, routes, occurrences, ...(observedAt === undefined ? {} : { observedAt }) };
 }
 
 function emptyLocalResult(reason: string, metrics: PhaseMetrics, totalMs = 0): LocalRecallResult {
@@ -308,8 +386,14 @@ async function runRecall(
   config: RecallConfig,
   dependencyOverrides: Partial<RecallDependencies> = {},
 ): Promise<{ prependContext: string } | undefined> {
+  const baseSearch = createMemorySearchDependency(api);
   const dependencies: RecallDependencies = {
-    search: dependencyOverrides.search ?? memorySearch,
+    search: dependencyOverrides.search ?? (async (query, options) => {
+      const result = await baseSearch(query, options);
+      if (!ctx.workspaceDir) return result;
+      const clean = await excludeVerificationEpisodes(result, ctx.workspaceDir, config.graphMemory.vectorDir);
+      return hydrateWikiExcerpts(clean, ctx.workspaceDir);
+    }),
     expand: dependencyOverrides.expand ?? expandQuery,
     graphSearch: dependencyOverrides.graphSearch ?? defaultGraphSearch,
     profileSearch: dependencyOverrides.profileSearch ?? defaultProfileSearch,
@@ -318,6 +402,8 @@ async function runRecall(
   };
   const startedAt = performance.now();
   const metrics: PhaseMetrics = { literalMs: 0, gateMs: 0, expansionMs: 0, searchMs: 0, fusionMs: 0, vectorMs: 0, graphMs: 0, profileMs: 0 };
+  const coldRetry: ColdRetryStats = { attempts: 0, retries: 0, rescued: 0 };
+  const candidateMinScore = resolveCandidateMinScore(config);
   const localPlan = resolveLocalPlanState(event, ctx, config);
   const { rawPrompt, cleaned, agent, session } = localPlan;
   if (localPlan.guardReason) {
@@ -337,10 +423,11 @@ async function runRecall(
   let gateFinishReason: string | undefined;
   let gateContentType: string | undefined;
   let gateHasReasoningContent: boolean | undefined;
-  const traceSearches: Array<{ route: string; query: string; hits: number; spawnMs: number; searchMs: number; totalMs: number }> = [];
+  const traceSearches: Array<{ route: string; query: string; hits: number; spawnMs: number; searchMs: number; totalMs: number; managerMs?: number }> = [];
   let expansionStatus: ExpansionStatus | "skipped_strong" | "skipped_speed" | "skipped_literal" | "not_run" = "not_run";
   let expansionDiagnostics: ExpansionDiagnostics | undefined;
   let fused = [] as ReturnType<typeof fuseRoutes>;
+  let qualityCandidates: NonNullable<TraceRecord["qualityCandidates"]> = [];
   let prependContext: string | undefined;
   let injectionLayers = { profile: 0, vector: 0, graph: 0 };
   let selectedHits = [] as ReturnType<typeof fuseRoutes>;
@@ -398,6 +485,7 @@ async function runRecall(
           profileHits,
           deterministicQueries,
           llmCalls,
+          candidateMinScore,
           ...(fallbackReason ? { fallbackReason } : {}),
         },
       });
@@ -425,6 +513,7 @@ async function runRecall(
       balancedLlmInvariant: depth !== "balanced" || llmCalls === 0,
       rescueStatus, rescueRemainingMs,
       expansion: expansionStatus, searches: traceSearches,
+      coldRetry,
       expansionParseMode: expansionDiagnostics?.parseMode,
       expansionFinishReason: expansionDiagnostics?.finishReason,
       expansionContentChars: expansionDiagnostics?.contentChars,
@@ -437,6 +526,8 @@ async function runRecall(
       qualityHighRawScore: config.qualityGate.highRawScore,
       qualityMediumRawScore: config.qualityGate.mediumRawScore,
       qualityMinRouteHits: config.qualityGate.minRouteHits,
+      candidateMinScore,
+      qualityCandidates,
       fusionTop: fused.map(({ path, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, source, routes, occurrences }) => ({
         path, bestRawScore, rrfScore, routeHits, sourceWeight, projectScope, projectWeight, finalRankScore, finalScore, source, routes, occurrences,
       })),
@@ -471,16 +562,16 @@ async function runRecall(
   if (demand.decision === "uncertain") {
     const gateStartedAt = performance.now();
     try {
-      const probe = scopeResult(await dependencies.search(searchQuery, {
+      const probe = scopeResult(await coldRetrySearch(dependencies, searchQuery, {
         agent,
         maxResults: scopedMaxResults(1, config),
-        minScore: config.minScore,
+        minScore: candidateMinScore,
         timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
-      }));
+      }, () => remainingMs(startedAt, config.maxTotalMs), coldRetry));
       probeLiteral = probe;
       vectorHits += probe.hits.length;
       probeTopScore = probe.hits[0]?.score;
-      probePassed = fuseForRecall([{ route: "probe", weight: config.rrf.originalWeight, result: probe }], config).length > 0;
+      probePassed = fuseForRecall([{ route: "probe", weight: config.rrf.originalWeight, result: probe }], config, searchQuery).length > 0;
       gateStatus = probePassed ? "bge_probe_pass" : "bge_probe_fail";
       gateReason = probePassed ? "bge_probe_quality_pass" : "bge_probe_quality_fail";
       traceSearches.push({ route: "probe", query: searchQuery, hits: probe.hits.length, ...probe.timing });
@@ -533,7 +624,7 @@ async function runRecall(
 
   if (routeDecision === "graph" && !graphFailed) {
     const fusionStartedAt = performance.now();
-    fused = fuseForRecall(auxiliaryRoutes, config);
+    fused = fuseForRecall(auxiliaryRoutes, config, searchQuery);
     metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
     inject();
     emitTrace(fused.length > 0 ? "ok" : emptyFusionStatus(auxiliaryRoutes));
@@ -547,10 +638,10 @@ async function runRecall(
     let literal = probeLiteral;
     if (!literal) {
       const literalStartedAt = performance.now();
-      literal = scopeResult(await dependencies.search(searchQuery, {
-        agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: config.minScore,
+      literal = scopeResult(await coldRetrySearch(dependencies, searchQuery, {
+        agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: candidateMinScore,
         timeoutMs: boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs)),
-      }));
+      }, () => remainingMs(startedAt, config.maxTotalMs), coldRetry));
       metrics.literalMs = Math.round(performance.now() - literalStartedAt);
       metrics.searchMs += metrics.literalMs;
       vectorHits += literal.hits.length;
@@ -561,7 +652,10 @@ async function runRecall(
 
     const fuseAndInject = (routes: SearchRoute[], partial: boolean): void => {
       const fusionStartedAt = performance.now();
-      fused = fuseForRecall(routes, config);
+      // Keep bounded score diagnostics before filtering, without source content.
+      qualityCandidates = routes.slice(0, 8).flatMap(({ route, result }) =>
+        result.hits.slice(0, 3).map(({ score, vectorScore, textScore }) => ({ route, score, vectorScore, textScore })));
+      fused = fuseForRecall(routes, config, searchQuery);
       metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
       inject();
       status = fused.length > 0 ? (partial || graphFailed ? "partial" : "ok") : emptyFusionStatus(routes);
@@ -582,7 +676,7 @@ async function runRecall(
       const routeBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
       const settled = await Promise.allSettled(deterministic.map(async (route): Promise<SearchRoute> => {
         const result = scopeResult(await dependencies.search(route.query, {
-          agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: config.minScore, timeoutMs: routeBudget,
+          agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: candidateMinScore, timeoutMs: routeBudget,
         }));
         vectorHits += result.hits.length;
         traceSearches.push({ route: route.route, query: route.query, hits: result.hits.length, ...result.timing });
@@ -635,7 +729,7 @@ async function runRecall(
             const rescueBudget = boundedTimeout(config.searchTimeoutMs, remainingMs(startedAt, config.maxTotalMs));
             const rescueSettled = await Promise.allSettled(rescueRoutes.map(async (route): Promise<SearchRoute> => {
               const result = scopeResult(await dependencies.search(route.query, {
-                agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: config.minScore, timeoutMs: rescueBudget,
+                agent, maxResults: scopedMaxResults(maxResultsForDepth(depth), config), minScore: candidateMinScore, timeoutMs: rescueBudget,
               }));
               vectorHits += result.hits.length;
               traceSearches.push({ route: `rescue:${route.route}`, query: route.query, hits: result.hits.length, ...result.timing });
@@ -657,7 +751,7 @@ async function runRecall(
     api.logger?.error?.(`active-recall vector fail-open: ${error instanceof Error ? error.message : String(error)}`);
     if (auxiliaryRoutes.length > 0) {
       const fusionStartedAt = performance.now();
-      fused = fuseForRecall(auxiliaryRoutes, config);
+      fused = fuseForRecall(auxiliaryRoutes, config, searchQuery);
       metrics.fusionMs += Math.round(performance.now() - fusionStartedAt);
       inject();
       status = fused.length > 0 ? "partial" : emptyFusionStatus(auxiliaryRoutes);
@@ -738,8 +832,9 @@ const plugin = {
         enqueueMemoryWrite(api, event, ctx, config);
       }, { timeoutMs: 1000 });
     }
+    scheduleMemoryWarmup(api, config);
   },
 };
 
-export { injectContext, isInternalSession, runRecall, statusForFailures };
+export { injectContext, isInternalSession, isVerificationSession, runRecall, statusForFailures };
 export default plugin;

@@ -65,7 +65,14 @@ export interface TraceRecord {
   qualityHighRawScore?: number;
   qualityMediumRawScore?: number;
   qualityMinRouteHits?: number;
+  candidateMinScore?: number;
+  qualityCandidates?: Array<{ route: string; score: number; vectorScore?: number; textScore?: number }>;
   searches: Array<{ route: string; query: string; hits: number } & SearchTiming>;
+  /**
+   * Cold-start retry bookkeeping, so production can tell a healthy warm search apart from one
+   * rescued by the retry (and from a retry that ran but did not help).
+   */
+  coldRetry?: { attempts: number; retries: number; rescued: number };
   fusionTop: Array<Pick<FusedHit, "path" | "bestRawScore" | "rrfScore" | "routeHits" | "sourceWeight" | "projectScope" | "projectWeight" | "finalRankScore" | "finalScore" | "source" | "routes" | "occurrences">>;
   injectedChars: number;
   injectedTokens: number;

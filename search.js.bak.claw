@@ -9,7 +9,7 @@ function diagLog(message        )       {
   try {
     const dir = join(homedir(), ".openclaw", "workspace", "memory");
     if (existsSync(dir)) {
-      void appendFile(join(dir, "inprocess-diag.log"), `[${new Date().toISOString()}] ${message}\n`, "utf8");
+      void appendFile(join(dir, "inprocess-diag.log"), `[${new Date().toISOString()}] ${message}\n`, "utf8").catch(() => undefined);
     }
   } catch {
     // 诊断日志失败不阻塞主流程
@@ -58,6 +58,20 @@ function resolveOpenClawEntry()                                         {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 function asNumber(value         , fallback = 0)         {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
@@ -66,17 +80,23 @@ function normalizeHit(value         )                   {
   if (value === null || typeof value !== "object") return null;
   const item = value                           ;
   if (typeof item.path !== "string" || typeof item.snippet !== "string") return null;
+  const provenance = item.provenance                                        ;
+  const observedAt = typeof provenance?.observedAt === "number" && Number.isFinite(provenance.observedAt)
+    ? provenance.observedAt
+    : undefined;
   return {
     path: item.path,
     line: typeof item.line === "number" ? item.line
       : typeof item.lineStart === "number" ? item.lineStart
       : typeof item.startLine === "number" ? item.startLine
       : undefined,
+    endLine: typeof item.endLine === "number" ? item.endLine : undefined,
     score: asNumber(item.score),
     vectorScore: typeof item.vectorScore === "number" ? item.vectorScore : undefined,
     textScore: typeof item.textScore === "number" ? item.textScore : undefined,
     snippet: item.snippet,
     source: typeof item.source === "string" ? item.source : "memory",
+    ...(observedAt === undefined ? {} : { observedAt }),
   };
 }
 
@@ -100,17 +120,24 @@ function normalizeMemoryHit(value
 
 
 
+
  )            {
+  const observedAt = typeof value.provenance?.observedAt === "number" && Number.isFinite(value.provenance.observedAt)
+    ? value.provenance.observedAt
+    : undefined;
   return {
     path: value.path,
     line: value.startLine ?? value.endLine,
+    endLine: value.endLine,
     score: asNumber(value.score),
     vectorScore: value.vectorScore,
     textScore: value.textScore,
     snippet: value.snippet,
     source: typeof value.source === "string" ? value.source : "memory",
+    ...(observedAt === undefined ? {} : { observedAt }),
   };
 }
+
 
 
 
@@ -171,6 +198,67 @@ function loadInProcessSdk()                                                     
   return sdkPromise;
 }
 
+/** 预热上下文：由插件入口注册，测试不注册 → 测试进程不会产生后台任务。 */
+
+
+                                                                             
+
+
+
+let warmupContext                       = null;
+let warmupInFlight = false;
+let lastWarmupAt = 0;
+const WARMUP_COOLDOWN_MS = 60_000;
+const WARMUP_TIMEOUT_MS = 60_000;
+
+/** 注册/清除预热上下文。 */
+export function setWarmupContext(context                      )       {
+  warmupContext = context;
+}
+
+/**
+ * 后台预热 in-process memory manager。
+ *
+ * Gateway 重启后首次 `MemoryIndexManager.get()` 实测 5–20s（冷态构建），远超 Active Recall 的
+ * `searchTimeoutMs`；预热把这段成本移出用户轮次预算，不产生注入/写入副作用。
+ * 去重 + 60s 冷却，失败只写诊断日志。
+ */
+export function warmMemorySearch(reason        )       {
+  if (!warmupContext || warmupInFlight) return;
+  const context = warmupContext;
+  let runtimeConfig         ;
+  try {
+    runtimeConfig = context.resolveRuntimeConfig();
+  } catch {
+    runtimeConfig = undefined;
+  }
+  if (runtimeConfig === undefined || runtimeConfig === null) {
+    diagLog(`warmup(${reason}) skipped: runtime config unavailable`);
+    return;
+  }
+  const now = Date.now();
+  if (now - lastWarmupAt < WARMUP_COOLDOWN_MS) return;
+  lastWarmupAt = now;
+  warmupInFlight = true;
+  void (async () => {
+    const startedAt = performance.now();
+    try {
+      const result = await tryInProcessSearch("memory warmup", {
+        agent: context.agent,
+        maxResults: 1,
+        minScore: 0.99,
+        timeoutMs: WARMUP_TIMEOUT_MS,
+        runtimeConfig,
+      }, WARMUP_TIMEOUT_MS);
+      diagLog(`warmup(${reason}) ${result ? "ok" : "miss"} ${Math.round(performance.now() - startedAt)}ms`);
+    } catch (error) {
+      diagLog(`warmup(${reason}) failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      warmupInFlight = false;
+    }
+  })();
+}
+
 /** 进程内检索：gateway 已注册的 memory runtime 直接复用（无 spawn，~毫秒级）。失败或超时返回 null。 */
 async function tryInProcessSearch(query        , options               , timeoutMs        )                               {
   const controller = new AbortController();
@@ -185,23 +273,36 @@ async function tryInProcessSearch(query        , options               , timeout
   }
 }
 
-async function inProcessSearchInner(query        , options               , signal              )                               {
+export async function inProcessSearchInner(query        , options               , signal              , sdkLoader = loadInProcessSdk)                               {
+  const requestStartedAt = performance.now();
   try {
-    const sdk = await loadInProcessSdk();
+    signal?.throwIfAborted();
+    const sdk = await sdkLoader();
+    signal?.throwIfAborted();
     if (!sdk) { diagLog("sdk unavailable"); return null; }
-    const cfgPath = join(homedir(), ".openclaw", "openclaw.json");
-    if (!existsSync(cfgPath)) { diagLog("cfg missing"); return null; }
-    const cfg = JSON.parse(await readFile(cfgPath, "utf8"))           ;
+    let cfg = options.runtimeConfig;
+    if (!cfg) {
+      const cfgPath = join(homedir(), ".openclaw", "openclaw.json");
+      if (!existsSync(cfgPath)) { diagLog("cfg missing"); return null; }
+      cfg = JSON.parse(await readFile(cfgPath, "utf8"))           ;
+    }
+    signal?.throwIfAborted();
+    const managerStartedAt = performance.now();
     const { manager, error: managerError } = await sdk.getActiveMemorySearchManager({ cfg, agentId: options.agent });
+    const managerMs = Math.round(performance.now() - managerStartedAt);
+    // Manager initialization may outlive the caller's deadline. Never start a
+    // late search (or accept late results from a provider ignoring cancellation).
+    signal?.throwIfAborted();
     if (managerError) diagLog(`manager error: ${managerError}`);
     if (!manager?.search) { diagLog("manager.search missing"); return null; }
     const startedAt = performance.now();
     const results = await manager.search(query, { maxResults: options.maxResults, minScore: options.minScore, signal });
+    signal?.throwIfAborted();
     const elapsed = Math.round(performance.now() - startedAt);
-    diagLog(`in-process ok: ${elapsed}ms hits=${(results ?? []).length}`);
+    diagLog(`in-process ok: init=${managerMs}ms search=${elapsed}ms hits=${(results ?? []).length}`);
     return {
       hits: (results ?? []).map(normalizeMemoryHit),
-      timing: { spawnMs: 0, searchMs: elapsed, totalMs: elapsed },
+      timing: { spawnMs: 0, searchMs: elapsed, managerMs, totalMs: Math.round(performance.now() - requestStartedAt) },
       rawOutput: "",
     };
   } catch (error) {
@@ -211,26 +312,32 @@ async function inProcessSearchInner(query        , options               , signa
 }
 
 /** Best-effort background indexing after a writer adds a memory markdown episode. */
-export async function triggerMemorySync(agentId        )                   {
+export async function triggerMemorySync(agentId        , runtimeConfig          )                   {
   const sdk = await loadInProcessSdk();
   if (!sdk) return false;
-  const cfgPath = join(homedir(), ".openclaw", "openclaw.json");
-  if (!existsSync(cfgPath)) return false;
-  const cfg = JSON.parse(await readFile(cfgPath, "utf8"))           ;
+  let cfg = runtimeConfig;
+  if (!cfg) {
+    const cfgPath = join(homedir(), ".openclaw", "openclaw.json");
+    if (!existsSync(cfgPath)) return false;
+    cfg = JSON.parse(await readFile(cfgPath, "utf8"))           ;
+  }
   const { manager } = await sdk.getActiveMemorySearchManager({ cfg, agentId });
   if (!manager?.sync) return false;
   await manager.sync({ reason: "active-recall-graph-writer" });
   return true;
 }
 
-/** 先走进程内（gateway 已缓存 manager），失败回退 CLI shell-out。 */
+/** Give the cached in-process manager the full budget; CLI fallback is viable only after a fast unavailability result. */
 export async function memorySearch(query        , options               )                        {
   const startedAt = performance.now();
-  const inProcessBudget = Math.min(options.timeoutMs, Math.max(250, Math.round(options.timeoutMs * 0.6)));
-  const inProcess = await tryInProcessSearch(query, options, inProcessBudget);
+  const inProcess = await tryInProcessSearch(query, options, options.timeoutMs);
   if (inProcess) return inProcess;
   const remaining = Math.floor(options.timeoutMs - (performance.now() - startedAt));
-  if (remaining <= 0) throw new Error(`memory search timeout after ${options.timeoutMs}ms`);
+  if (remaining <= 0) {
+    // 探针超时通常意味着冷态 manager；后台预热让下一次召回直接命中热态，不改变本轮延迟。
+    warmMemorySearch("probe-timeout");
+    throw new Error(`memory search timeout after ${options.timeoutMs}ms`);
+  }
   return cliMemorySearch(query, { ...options, timeoutMs: remaining });
 }
 

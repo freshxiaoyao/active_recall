@@ -37,6 +37,8 @@ export interface LocalRecallEvidence {
   bestRawScore: number;
   rrfScore: number;
   routeHits: number;
+  /** Host provenance (epoch ms) for the observed fact, when available. */
+  observedAt?: number;
   sourceWeight: number;
   projectScope?: "same-project" | "global" | "other-project";
   projectWeight: number;

@@ -1,7 +1,20 @@
 const blockPatterns = [
   /<recall-context\b[^>]*>[\s\S]*?<\/recall-context\s*>/gi,
   /<vault-[\w:-]+\b[^>]*>[\s\S]*?<\/vault-[\w:-]+\s*>/gi,
+  /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>[\s\S]*?<<<END_OPENCLAW_INTERNAL_CONTEXT>>>/gi,
 ];
+
+// Routed deliveries (inter-session messages, subagent tasks) prepend OpenClaw-owned framing.
+// Measured 2026-09-09: a subagent turn searched on the envelope text instead of the question
+// (`queryChars=778`, envelope only), which injected three unrelated memories.
+// Anchoring on `^` proved fragile (zero-width prefix / curly apostrophe survived), so these
+// rules match the framing substring anywhere and tolerate both apostrophes.
+const routedEnvelope = /\[?\s*Inter-session message\b[\s\S]{0,800}?policy allows the source\.?\]?/i;
+const routedEnvelopeLine = /\[?\s*Inter-session message\b[^\n]*(?:\r?\n|$)/gi;
+const routedMetadataLine = /^\s*(?:sourceSession|sourceChannel|sourceTool|isUser)\s*=.*(?:\r?\n|$)/gim;
+const routedTaskMarker = /^\s*\[(?:Subagent Task|Internal task completion event)\][ \t]*/gim;
+const conversationInfoBlock = /^[^\S\r\n]*(?:\[[^\]\r\n]*\][^\S\r\n]*)?Conversation info:\s*⟦openclaw:ctx⟧[\s\S]*?```[\s\S]*?```[ \t]*\r?\n?/gim;
+const invisibleChars = /[\u200b-\u200d\ufeff]/g;
 
 function stripLabeledBlock(input        , label        )         {
   const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -14,6 +27,13 @@ function stripLabeledBlock(input        , label        )         {
 export function cleanPromptForSearch(prompt        )         {
   let cleaned = prompt;
   for (const pattern of blockPatterns) cleaned = cleaned.replace(pattern, "");
+  cleaned = cleaned
+    .replace(invisibleChars, "")
+    .replace(routedEnvelope, "")
+    .replace(routedEnvelopeLine, "")
+    .replace(routedMetadataLine, "")
+    .replace(routedTaskMarker, "")
+    .replace(conversationInfoBlock, "");
   cleaned = stripLabeledBlock(cleaned, "Sender (untrusted metadata)");
   cleaned = stripLabeledBlock(cleaned, "OpenClaw runtime context (internal)");
   cleaned = cleaned
